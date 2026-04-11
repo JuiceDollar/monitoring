@@ -1,0 +1,72 @@
+name: JUSD Monitoring Frontend PRD CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'shared/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'shared/**'
+  workflow_dispatch:
+
+env:
+  DOCKER_TAGS: juicedollar/monitoring-web:latest
+  DEPLOY_SERVICE: jusd-monitoring-web
+
+jobs:
+  build:
+    name: Build Frontend
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -f frontend/Dockerfile -t ${{ env.DOCKER_TAGS }} .
+
+  deploy:
+    name: Deploy Frontend to PRD
+    runs-on: ubuntu-24.04-arm
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: ${{ env.DOCKER_TAGS }}
+          platforms: linux/arm64
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2025.4.0/cloudflared-linux-arm64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Deploy to server
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_PRD_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.DEPLOY_PRD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key \
+            -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_PRD_HOST }}" \
+            ${{ secrets.DEPLOY_PRD_USER }}@${{ secrets.DEPLOY_PRD_HOST }} \
+            "${{ env.DEPLOY_SERVICE }}"

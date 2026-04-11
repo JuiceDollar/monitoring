@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+/* Monospace font stack and background */
+html, body {
+  font-family: 'JetBrains Mono', 'Fira Code', Monaco, Consolas, monospace;
+  background-color: #0a0a0a; /* matches bg-neutral-950 */
+}
+
+/* Prevent overscroll bounce on macOS/iOS */
+body {
+  overscroll-behavior: none;
+}
