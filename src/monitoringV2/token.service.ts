@@ -32,6 +32,9 @@ export class TokenService {
 		this.cache.clear();
 		for (const token of tokens) {
 			this.cache.set(token.address.toLowerCase(), token);
+			if (token.symbol?.toUpperCase() === 'WCBTC') {
+				this.priceService.registerWcbtcAddress(token.address);
+			}
 		}
 
 		this.logger.log(`Loaded ${this.cache.size} tokens into cache`);
@@ -71,6 +74,9 @@ export class TokenService {
 				...c,
 				address: formattedAddress,
 			});
+			if (c.symbol?.toUpperCase() === 'WCBTC') {
+				this.priceService.registerWcbtcAddress(formattedAddress);
+			}
 		}
 	}
 

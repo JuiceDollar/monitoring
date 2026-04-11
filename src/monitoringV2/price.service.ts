@@ -4,6 +4,19 @@ import axios from 'axios';
 import { ethers } from 'ethers';
 import { ProviderService } from './provider.service';
 import { AppConfigService } from 'src/config/config.service';
+import { TokenRepository } from './prisma/repositories/token.repository';
+
+interface TokenPrice {
+	data: {
+		id: string;
+		type: string;
+		attributes: {
+			token_prices: {
+				[key: string]: string;
+			};
+		};
+	};
+}
 
 interface PriceCacheEntry {
 	value: string;
@@ -15,6 +28,7 @@ export class PriceService {
 	private readonly CACHE_TTL_MS: number;
 	private readonly logger = new Logger(PriceService.name);
 	private priceCache = new Map<string, PriceCacheEntry>();
+	private wcbtcAddresses = new Set<string>();
 
 	constructor(
 		private readonly providerService: ProviderService,
@@ -23,26 +37,49 @@ export class PriceService {
 		this.CACHE_TTL_MS = this.appConfigService.priceCacheTtlMs;
 	}
 
+	registerWcbtcAddress(address: string): void {
+		this.wcbtcAddresses.add(address.toLowerCase());
+	}
+
+	private isWcbtc(address: string): boolean {
+		return this.wcbtcAddresses.has(address.toLowerCase());
+	}
+
 	async getTokenPricesInUsd(addresses: string[]): Promise<{ [key: string]: string }> {
 		const equityAddress = ADDRESS[this.appConfigService.blockchainId]?.equity?.toLowerCase();
-		const equityAddresses = addresses.filter((addr) => addr.toLowerCase() === equityAddress);
-		const remainingAddresses = addresses.filter((addr) => addr.toLowerCase() !== equityAddress);
 
-		const [equityPrices, btcPrice] = await Promise.all([
+		const equityAddresses = addresses.filter((addr) => addr.toLowerCase() === equityAddress);
+		const wcbtcAddresses = addresses.filter((addr) => this.isWcbtc(addr));
+		const standardAddresses = addresses.filter(
+			(addr) => addr.toLowerCase() !== equityAddress && !this.isWcbtc(addr)
+		);
+
+		const [equityPrices, wcbtcPrices, geckoTerminalPrices] = await Promise.all([
 			this.getEquityPrice(equityAddresses),
-			this.getBtcPriceInUsd(),
+			this.getWcbtcPrices(wcbtcAddresses),
+			this.getGeckoTerminalPricesInUSD(standardAddresses),
 		]);
 
-		// All non-equity tokens on Citrea are BTC-backed (WCBTC, cBTC) — use BTC price
-		const btcPrices: { [key: string]: string } = {};
-		if (btcPrice) {
-			for (const addr of remainingAddresses) {
-				btcPrices[addr] = btcPrice;
-				this.setCache(addr, btcPrice);
-			}
+		return { ...geckoTerminalPrices, ...wcbtcPrices, ...equityPrices };
+	}
+
+	private async getWcbtcPrices(addresses: string[]): Promise<{ [key: string]: string }> {
+		if (addresses.length === 0) return {};
+
+		const cached = this.getFromCache(addresses);
+		const remaining = addresses.filter((addr) => !cached[addr]);
+		if (remaining.length === 0) return cached;
+
+		const btcPrice = await this.getBtcPriceInUsd();
+		if (!btcPrice) return cached;
+
+		const prices: { [key: string]: string } = {};
+		for (const addr of remaining) {
+			prices[addr] = btcPrice;
+			this.setCache(addr, btcPrice);
 		}
 
-		return { ...btcPrices, ...equityPrices };
+		return { ...cached, ...prices };
 	}
 
 	private async getBtcPriceInUsd(): Promise<string | null> {
@@ -68,6 +105,40 @@ export class PriceService {
 		} catch (error) {
 			this.logger.error(`Failed to fetch BTC price: ${error.message}`);
 			return cached?.value ?? null;
+		}
+	}
+
+	private async getGeckoTerminalPricesInUSD(addresses: string[]): Promise<{ [key: string]: string }> {
+		if (addresses.length === 0) return {};
+
+		const cached = this.getFromCache(addresses);
+		const remaining = addresses.filter((addr) => !cached[addr]);
+		if (remaining.length === 0) return cached;
+
+		try {
+			const response = await axios.get<TokenPrice>(
+				`https://api.geckoterminal.com/api/v2/simple/networks/citrea/token_price/${remaining.map((a) => a.toLowerCase()).join(',')}`,
+				{
+					headers: { accept: 'application/json' },
+					timeout: 10000,
+				}
+			);
+
+			const apiPrices = response.data.data.attributes.token_prices;
+			const normalizedPrices: { [key: string]: string } = {};
+			for (const inputAddress of remaining) {
+				const price = apiPrices[inputAddress.toLowerCase()];
+				if (price) {
+					normalizedPrices[inputAddress] = price;
+					this.setCache(inputAddress, price);
+				}
+			}
+
+			this.logger.log(`Fetched prices for ${Object.keys(normalizedPrices).length} tokens from GeckoTerminal`);
+			return { ...cached, ...normalizedPrices };
+		} catch (error) {
+			this.logger.error('Failed to fetch token prices from GeckoTerminal:', error.message);
+			return cached;
 		}
 	}
 
