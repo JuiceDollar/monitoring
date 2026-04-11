@@ -27,7 +27,7 @@ export function CollateralTable({ data, error }: DataState<CollateralResponse[]>
 			}),
 		},
 		{
-			header: { primary: 'TVL (EUR)', secondary: 'PRICE (EUR)' },
+			header: { primary: 'TVL (USD)', secondary: 'PRICE (USD)' },
 			align: Alignment.RIGHT,
 			format: (collateral): MultiLineCell => {
 				const price = parseFloat(collateral.price);
