@@ -18,7 +18,7 @@ on:
         default: false
 
 env:
-  DOCKER_TAGS: juicedollar/monitoring:beta
+  DOCKER_TAGS: juicedollarcom/monitoring:beta
   DEPLOY_SERVICE: jusd-monitoring
 
 jobs:
