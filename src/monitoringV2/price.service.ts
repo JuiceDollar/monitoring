@@ -5,18 +5,6 @@ import { ethers } from 'ethers';
 import { ProviderService } from './provider.service';
 import { AppConfigService } from 'src/config/config.service';
 
-interface TokenPrice {
-	data: {
-		id: string;
-		type: string;
-		attributes: {
-			token_prices: {
-				[key: string]: string;
-			};
-		};
-	};
-}
-
 interface PriceCacheEntry {
 	value: string;
 	timestamp: number;
@@ -38,61 +26,48 @@ export class PriceService {
 	async getTokenPricesInUsd(addresses: string[]): Promise<{ [key: string]: string }> {
 		const equityAddress = ADDRESS[this.appConfigService.blockchainId]?.equity?.toLowerCase();
 		const equityAddresses = addresses.filter((addr) => addr.toLowerCase() === equityAddress);
-		const standardAddresses = addresses.filter((addr) => addr.toLowerCase() !== equityAddress);
+		const remainingAddresses = addresses.filter((addr) => addr.toLowerCase() !== equityAddress);
 
-		const [equityPrices, geckoTerminalPrices] = await Promise.all([
+		const [equityPrices, btcPrice] = await Promise.all([
 			this.getEquityPrice(equityAddresses),
-			this.getGeckoTerminalPricesInUSD(standardAddresses),
+			this.getBtcPriceInUsd(),
 		]);
 
-		return { ...geckoTerminalPrices, ...equityPrices };
+		// All non-equity tokens on Citrea are BTC-backed (WCBTC, cBTC) — use BTC price
+		const btcPrices: { [key: string]: string } = {};
+		if (btcPrice) {
+			for (const addr of remainingAddresses) {
+				btcPrices[addr] = btcPrice;
+				this.setCache(addr, btcPrice);
+			}
+		}
+
+		return { ...btcPrices, ...equityPrices };
 	}
 
-	/**
-	 * Fetches token prices from GeckoTerminal API with caching.
-	 * Note: Citrea may not be supported by GeckoTerminal yet.
-	 * Falls back to cached values or empty results if unavailable.
-	 */
-	private async getGeckoTerminalPricesInUSD(addresses: string[]): Promise<{ [key: string]: string }> {
-		if (addresses.length === 0) return {};
-
-		const cached = this.getFromCache(addresses);
-		const remaining = addresses.filter((addr) => !cached[addr]);
-		if (remaining.length === 0) {
-			this.logger.debug('Returning cached prices for all requested tokens');
-			return cached;
+	private async getBtcPriceInUsd(): Promise<string | null> {
+		const cached = this.priceCache.get('btc-usd');
+		if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+			return cached.value;
 		}
 
 		try {
-			// Try Citrea network on GeckoTerminal (network slug may vary)
-			const response = await axios.get<TokenPrice>(
-				`https://api.geckoterminal.com/api/v2/simple/networks/citrea/token_price/${remaining.map((a) => a.toLowerCase()).join(',')}`,
-				{
-					headers: { accept: 'application/json' },
-					timeout: 10000,
-				}
-			);
+			const apiKey = this.appConfigService.coingeckoApiKey;
+			const headers: Record<string, string> = { accept: 'application/json' };
+			if (apiKey) headers['x-cg-demo-api-key'] = apiKey;
 
-			const apiPrices = response.data.data.attributes.token_prices;
-			const normalizedPrices: { [key: string]: string } = {};
-			for (const inputAddress of remaining) {
-				const price = apiPrices[inputAddress.toLowerCase()];
-				if (price) {
-					normalizedPrices[inputAddress] = price;
-					this.setCache(inputAddress, price);
-				}
-			}
+			const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', {
+				headers,
+				timeout: 10000,
+			});
 
-			this.logger.log(`Fetched prices for ${Object.keys(normalizedPrices).length} tokens from GeckoTerminal`);
-			return { ...cached, ...normalizedPrices };
+			const price = String(response.data.bitcoin.usd);
+			this.priceCache.set('btc-usd', { value: price, timestamp: Date.now() });
+			this.logger.log(`BTC price: $${price}`);
+			return price;
 		} catch (error) {
-			this.logger.error('Failed to fetch token prices from GeckoTerminal:', error);
-			if (cached) {
-				this.logger.warn('Returning expired cached prices due to API error');
-				return cached;
-			}
-
-			return {};
+			this.logger.error(`Failed to fetch BTC price: ${error.message}`);
+			return cached?.value ?? null;
 		}
 	}
 
