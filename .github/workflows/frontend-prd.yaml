@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 env:
-  DOCKER_TAGS: juicedollar/monitoring-web:latest
+  DOCKER_TAGS: juicedollarcom/monitoring-web:latest
   DEPLOY_SERVICE: jusd-monitoring-web
 
 jobs:

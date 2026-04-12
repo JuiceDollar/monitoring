@@ -18,3 +18,5 @@ npm run dev
 - **CollateralTable** - Supported collateral tokens
 
 Data refreshes every minute.
+
+

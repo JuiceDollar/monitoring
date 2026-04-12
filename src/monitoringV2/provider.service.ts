@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { Injectable, Logger } from '@nestjs/common';
-import { MulticallWrapper, MulticallProvider } from 'ethers-multicall-provider';
+// Note: Multicall3 is not deployed on Citrea, so we use the standard provider
+// and batch calls sequentially instead of using MulticallWrapper.
 import { AppConfigService } from 'src/config/config.service';
 
 class RpcStats {
@@ -98,7 +99,7 @@ export class ProviderService {
 
 	private readonly logger = new Logger(ProviderService.name);
 	private ethersProvider: ethers.JsonRpcProvider;
-	private multicallProviderInstance: MulticallProvider<ethers.JsonRpcProvider>;
+	private multicallProviderInstance: ethers.JsonRpcProvider;
 	private blockCache = new Map<number, ethers.Block>();
 	private rpcStats = new RpcStats();
 
@@ -111,17 +112,15 @@ export class ProviderService {
 		this.logger.log(
 			`LoggingJsonRpcProvider initialized with _send() override for RPC call tracking (timeout: ${this.config.rpcTimeoutMs}ms)`
 		);
-		this.multicallProviderInstance = MulticallWrapper.wrap(this.ethersProvider, ProviderService.CALLEDATA_LIMIT);
-		this.logger.log(
-			`Multicall provider initialized with ${ProviderService.CALLEDATA_LIMIT} bytes calldata limit and ${this.config.rpcTimeoutMs}ms timeout`
-		);
+		this.multicallProviderInstance = this.ethersProvider;
+		this.logger.log(`Provider initialized (no Multicall3 on Citrea, using sequential calls)`);
 	}
 
 	get provider(): ethers.JsonRpcProvider {
 		return this.ethersProvider;
 	}
 
-	get multicallProvider(): MulticallProvider<ethers.JsonRpcProvider> {
+	get multicallProvider(): ethers.JsonRpcProvider {
 		return this.multicallProviderInstance;
 	}
 

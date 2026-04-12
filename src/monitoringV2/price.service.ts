@@ -4,6 +4,7 @@ import axios from 'axios';
 import { ethers } from 'ethers';
 import { ProviderService } from './provider.service';
 import { AppConfigService } from 'src/config/config.service';
+import { TokenRepository } from './prisma/repositories/token.repository';
 
 interface TokenPrice {
 	data: {
@@ -27,6 +28,7 @@ export class PriceService {
 	private readonly CACHE_TTL_MS: number;
 	private readonly logger = new Logger(PriceService.name);
 	private priceCache = new Map<string, PriceCacheEntry>();
+	private wcbtcAddresses = new Set<string>();
 
 	constructor(
 		private readonly providerService: ProviderService,
@@ -35,36 +37,85 @@ export class PriceService {
 		this.CACHE_TTL_MS = this.appConfigService.priceCacheTtlMs;
 	}
 
+	registerWcbtcAddress(address: string): void {
+		this.wcbtcAddresses.add(address.toLowerCase());
+	}
+
+	private isWcbtc(address: string): boolean {
+		return this.wcbtcAddresses.has(address.toLowerCase());
+	}
+
 	async getTokenPricesInUsd(addresses: string[]): Promise<{ [key: string]: string }> {
 		const equityAddress = ADDRESS[this.appConfigService.blockchainId]?.equity?.toLowerCase();
-		const equityAddresses = addresses.filter((addr) => addr.toLowerCase() === equityAddress);
-		const standardAddresses = addresses.filter((addr) => addr.toLowerCase() !== equityAddress);
 
-		const [equityPrices, geckoTerminalPrices] = await Promise.all([
+		const equityAddresses = addresses.filter((addr) => addr.toLowerCase() === equityAddress);
+		const wcbtcAddresses = addresses.filter((addr) => this.isWcbtc(addr));
+		const standardAddresses = addresses.filter(
+			(addr) => addr.toLowerCase() !== equityAddress && !this.isWcbtc(addr)
+		);
+
+		const [equityPrices, wcbtcPrices, geckoTerminalPrices] = await Promise.all([
 			this.getEquityPrice(equityAddresses),
+			this.getWcbtcPrices(wcbtcAddresses),
 			this.getGeckoTerminalPricesInUSD(standardAddresses),
 		]);
 
-		return { ...geckoTerminalPrices, ...equityPrices };
+		return { ...geckoTerminalPrices, ...wcbtcPrices, ...equityPrices };
 	}
 
-	/**
-	 * Fetches token prices from GeckoTerminal API with caching.
-	 * Note: Citrea may not be supported by GeckoTerminal yet.
-	 * Falls back to cached values or empty results if unavailable.
-	 */
+	private async getWcbtcPrices(addresses: string[]): Promise<{ [key: string]: string }> {
+		if (addresses.length === 0) return {};
+
+		const cached = this.getFromCache(addresses);
+		const remaining = addresses.filter((addr) => !cached[addr]);
+		if (remaining.length === 0) return cached;
+
+		const btcPrice = await this.getBtcPriceInUsd();
+		if (!btcPrice) return cached;
+
+		const prices: { [key: string]: string } = {};
+		for (const addr of remaining) {
+			prices[addr] = btcPrice;
+			this.setCache(addr, btcPrice);
+		}
+
+		return { ...cached, ...prices };
+	}
+
+	private async getBtcPriceInUsd(): Promise<string | null> {
+		const cached = this.priceCache.get('btc-usd');
+		if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+			return cached.value;
+		}
+
+		try {
+			const apiKey = this.appConfigService.coingeckoApiKey;
+			const headers: Record<string, string> = { accept: 'application/json' };
+			if (apiKey) headers['x-cg-demo-api-key'] = apiKey;
+
+			const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', {
+				headers,
+				timeout: 10000,
+			});
+
+			const price = String(response.data.bitcoin.usd);
+			this.priceCache.set('btc-usd', { value: price, timestamp: Date.now() });
+			this.logger.log(`BTC price: $${price}`);
+			return price;
+		} catch (error) {
+			this.logger.error(`Failed to fetch BTC price: ${error.message}`);
+			return cached?.value ?? null;
+		}
+	}
+
 	private async getGeckoTerminalPricesInUSD(addresses: string[]): Promise<{ [key: string]: string }> {
 		if (addresses.length === 0) return {};
 
 		const cached = this.getFromCache(addresses);
 		const remaining = addresses.filter((addr) => !cached[addr]);
-		if (remaining.length === 0) {
-			this.logger.debug('Returning cached prices for all requested tokens');
-			return cached;
-		}
+		if (remaining.length === 0) return cached;
 
 		try {
-			// Try Citrea network on GeckoTerminal (network slug may vary)
 			const response = await axios.get<TokenPrice>(
 				`https://api.geckoterminal.com/api/v2/simple/networks/citrea/token_price/${remaining.map((a) => a.toLowerCase()).join(',')}`,
 				{
@@ -86,13 +137,8 @@ export class PriceService {
 			this.logger.log(`Fetched prices for ${Object.keys(normalizedPrices).length} tokens from GeckoTerminal`);
 			return { ...cached, ...normalizedPrices };
 		} catch (error) {
-			this.logger.error('Failed to fetch token prices from GeckoTerminal:', error);
-			if (cached) {
-				this.logger.warn('Returning expired cached prices due to API error');
-				return cached;
-			}
-
-			return {};
+			this.logger.error('Failed to fetch token prices from GeckoTerminal:', error.message);
+			return cached;
 		}
 	}
 
