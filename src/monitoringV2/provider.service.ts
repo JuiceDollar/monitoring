@@ -125,7 +125,7 @@ export class ProviderService {
 	}
 
 	async callBatch<T>(thunks: Array<() => Promise<T>>, retries = 5): Promise<T[]> {
-		const BATCH_SIZE = 50;
+		const BATCH_SIZE = parseInt(process.env.RPC_BATCH_SIZE || '25');
 		const results: T[] = [];
 
 		for (let i = 0; i < thunks.length; i += BATCH_SIZE) {
