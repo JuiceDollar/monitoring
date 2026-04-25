@@ -19,8 +19,7 @@ on:
 
 env:
   DOCKER_TAGS: juicedollarcom/monitoring:beta
-  DEPLOY_SERVICE_JDT: jdt-monitoring
-  DEPLOY_SERVICE_JDM: jdm-monitoring
+  DEPLOY_SERVICE: jusd-monitoring
 
 jobs:
   build:
@@ -81,11 +80,7 @@ jobs:
           ssh -i ~/.ssh/deploy_key \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_DEV_HOST }}" \
             ${{ secrets.DEPLOY_DEV_USER }}@${{ secrets.DEPLOY_DEV_HOST }} \
-            "${{ env.DEPLOY_SERVICE_JDT }}"
-          ssh -i ~/.ssh/deploy_key \
-            -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_DEV_HOST }}" \
-            ${{ secrets.DEPLOY_DEV_USER }}@${{ secrets.DEPLOY_DEV_HOST }} \
-            "${{ env.DEPLOY_SERVICE_JDM }}"
+            "${{ env.DEPLOY_SERVICE }}"
 
   reset-database:
     name: Reset Database
