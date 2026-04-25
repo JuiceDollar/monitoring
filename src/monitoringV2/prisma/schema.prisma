@@ -216,3 +216,25 @@ model JusdState {
 
   @@map("jusd_state")
 }
+
+// Telegram alert subscribers — populated via /start command on the bot
+model TelegramSubscriber {
+  chatId    String   @id @map("chat_id") @db.VarChar(32)
+  username  String?  @db.VarChar(64)
+  firstName String?  @map("first_name") @db.VarChar(128)
+  lastName  String?  @map("last_name") @db.VarChar(128)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([active], map: "idx_telegram_subscribers_active")
+  @@map("telegram_subscribers")
+}
+
+// Singleton row tracking the last processed Telegram update_id for long-polling
+model TelegramPollState {
+  id           Int    @id @default(1)
+  lastUpdateId BigInt @default(0) @map("last_update_id")
+
+  @@map("telegram_poll_state")
+}

@@ -55,17 +55,18 @@ export class MonitoringConfig {
 	telegramBotToken?: string;
 
 	@IsOptional()
-	@IsString()
-	telegramChatId?: string;
-
-	@IsOptional()
 	@IsBoolean()
 	telegramAlertsEnabled?: boolean;
+
+	telegramBootstrapSubscribers: string[];
 
 	@IsOptional()
 	@IsNumber()
 	@Min(1)
 	alertTimeframeHours?: number;
+
+	@IsUrl()
+	explorerBaseUrl: string;
 
 	@IsOptional()
 	@IsString()
@@ -88,9 +89,13 @@ export default registerAs('monitoring', () => {
 	config.rpcTimeoutMs = parseInt(process.env.RPC_TIMEOUT_MS || '60000');
 
 	config.telegramBotToken = process.env.TELEGRAM_BOT_TOKEN || '';
-	config.telegramChatId = process.env.TELEGRAM_CHAT_ID || '';
 	config.telegramAlertsEnabled = (process.env.TELEGRAM_ALERTS_ENABLED || 'false').toLowerCase() === 'true';
+	config.telegramBootstrapSubscribers = (process.env.TELEGRAM_BOOTSTRAP_SUBSCRIBERS || '')
+		.split(',')
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
 	config.alertTimeframeHours = parseInt(process.env.ALERT_TIMEFRAME_HOURS || '12');
+	config.explorerBaseUrl = process.env.EXPLORER_BASE_URL || 'https://citreascan.com';
 	config.coingeckoApiKey = process.env.COINGECKO_API_KEY || '';
 
 	const errors = validateSync(plainToClass(MonitoringConfig, config));

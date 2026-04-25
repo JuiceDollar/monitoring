@@ -53,16 +53,20 @@ export class AppConfigService {
 		return this.monitoringConfig.telegramBotToken;
 	}
 
-	get telegramChatId(): string | undefined {
-		return this.monitoringConfig.telegramChatId;
-	}
-
 	get telegramAlertsEnabled(): boolean {
 		return this.monitoringConfig.telegramAlertsEnabled || false;
 	}
 
+	get telegramBootstrapSubscribers(): string[] {
+		return this.monitoringConfig.telegramBootstrapSubscribers;
+	}
+
 	get alertTimeframeHours(): number {
 		return this.monitoringConfig.alertTimeframeHours || 12;
+	}
+
+	get explorerBaseUrl(): string {
+		return this.monitoringConfig.explorerBaseUrl;
 	}
 
 	get coingeckoApiKey(): string | undefined {

@@ -11,6 +11,8 @@ import { ChallengeRepository } from './prisma/repositories/challenge.repository'
 import { CollateralRepository } from './prisma/repositories/collateral.repository';
 import { MinterRepository } from './prisma/repositories/minter.repository';
 import { JusdRepository } from './prisma/repositories/jusd.repository';
+import { TelegramSubscriberRepository } from './prisma/repositories/telegram-subscriber.repository';
+import { TelegramPollStateRepository } from './prisma/repositories/telegram-poll-state.repository';
 import { ContractService } from './contract.service';
 import { EventService } from './event.service';
 import { TokenService } from './token.service';
@@ -22,6 +24,7 @@ import { JusdService } from './jusd.service';
 import { MonitoringService } from './monitoring.service';
 import { PriceService } from './price.service';
 import { TelegramService } from './telegram.service';
+import { TelegramPollerService } from './telegram-poller.service';
 import { ApiModule } from './api/api.module';
 
 @Module({
@@ -40,6 +43,8 @@ import { ApiModule } from './api/api.module';
 		CollateralRepository,
 		MinterRepository,
 		JusdRepository,
+		TelegramSubscriberRepository,
+		TelegramPollStateRepository,
 		ContractService,
 		EventService,
 		TokenService,
@@ -49,6 +54,7 @@ import { ApiModule } from './api/api.module';
 		MinterService,
 		JusdService,
 		TelegramService,
+		TelegramPollerService,
 		MonitoringService,
 	],
 	exports: [MonitoringService, ContractService, EventService, ApiModule],
