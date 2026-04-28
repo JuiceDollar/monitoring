@@ -102,4 +102,4 @@ jobs:
           ssh -i ~/.ssh/deploy_key \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_PRD_HOST }}" \
             ${{ secrets.DEPLOY_PRD_USER }}@${{ secrets.DEPLOY_PRD_HOST }} \
-            "reset-monitoring-db"
+            "reset-jusd-monitoring-db"
