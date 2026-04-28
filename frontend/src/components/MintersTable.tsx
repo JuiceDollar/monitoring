@@ -1,7 +1,7 @@
 import { MinterStatus, MinterType, type MinterResponse } from '../../../shared/types';
 import { Alignment, Table } from './Table';
 import type { Column, MultiLineCell } from './Table';
-import { formatNumber, formatCountdown, formatDateTime, formatPercent, getStatusColor } from '../lib/formatters';
+import { formatNumber, formatCountdown, formatDateTime, getStatusColor } from '../lib/formatters';
 import { AddressLink } from './AddressLink';
 import { colors } from '../lib/theme';
 import type { DataState } from '../lib/api.hook';
@@ -13,16 +13,17 @@ interface MinterTableProps {
 export function MintersTable({ data }: MinterTableProps) {
 	if (!data) return null;
 
+	const genericMinters: DataState<MinterResponse[]> = {
+		data: data.data?.filter((m) => m.type !== MinterType.BRIDGE),
+		error: data.error,
+	};
+
 	const columns: Column<MinterResponse>[] = [
 		{
-			header: { primary: 'MINTER', secondary: 'MESSAGE' },
+			header: { primary: 'MINTER', secondary: 'STATUS' },
 			format: (minter): MultiLineCell => ({
 				primary: (
-					<AddressLink
-						address={minter.address}
-						className="font-mono"
-						bridgeTokenSymbol={minter.type === MinterType.BRIDGE ? minter.bridgeTokenSymbol : undefined}
-					/>
+					<AddressLink address={minter.address} className="font-mono" />
 				),
 				secondary: minter.status,
 				secondaryClass: getStatusColor(minter.status),
@@ -41,50 +42,19 @@ export function MintersTable({ data }: MinterTableProps) {
 			},
 		},
 		{
-			header: { primary: 'MINTED', secondary: 'LIMIT' },
+			header: { primary: 'FEE' },
 			align: Alignment.RIGHT,
-			format: (minter): MultiLineCell => {
-				const isBridge = minter.type === MinterType.BRIDGE;
-				return {
-					primary: isBridge ? formatNumber(minter.bridgeMinted || 0) : '-',
-					secondary: isBridge ? formatNumber(minter.bridgeLimit || 0) : '-',
-				};
-			},
-		},
-		{
-			header: { primary: 'UTIL. %', secondary: 'AVAILABLE' },
-			align: Alignment.RIGHT,
-			format: (minter) => {
-				const isBridge = minter.type === MinterType.BRIDGE;
-				const minted = isBridge && minter.bridgeMinted ? Number(minter.bridgeMinted) : 0;
-				const limit = isBridge && minter.bridgeLimit ? Number(minter.bridgeLimit) : 0;
-				const utilization = limit > 0 ? (minted * 100) / limit : undefined;
-				const availableForMint = limit > 0 ? formatNumber(limit - minted) : '-';
-				return {
-					primary: utilization !== undefined ? formatPercent(utilization) : '-',
-					secondary: availableForMint,
-					primaryClass: utilization !== undefined ? getUtilizationColor(utilization) : undefined,
-				};
-			},
-		},
-		{
-			header: { primary: 'EXPIRY', secondary: 'COUNTDOWN' },
-			align: Alignment.RIGHT,
-			format: (minter): MultiLineCell => {
-				const isBridge = minter.type === MinterType.BRIDGE;
-				return {
-					primary: isBridge && minter.bridgeHorizon ? formatDateTime(Number(minter.bridgeHorizon)) : '-',
-					secondary: isBridge && minter.bridgeHorizon ? formatCountdown(minter.bridgeHorizon) : '-',
-				};
-			},
+			format: (minter): MultiLineCell => ({
+				primary: formatNumber(minter.applicationFee),
+			}),
 		},
 	];
 
 	return (
 		<Table
 			title="MINTERS"
-			data={data?.data}
-			error={data?.error}
+			data={genericMinters.data}
+			error={genericMinters.error}
 			columns={columns}
 			getRowKey={(minter) => minter.address}
 			hidden={(minter) => minter.status === MinterStatus.DENIED || minter.status === MinterStatus.EXPIRED}
@@ -92,10 +62,4 @@ export function MintersTable({ data }: MinterTableProps) {
 			emptyMessage="No minters found"
 		/>
 	);
-}
-
-function getUtilizationColor(utilization: number): string {
-	if (utilization > 90) return colors.critical;
-	if (utilization > 70) return colors.highlight;
-	return colors.success;
 }

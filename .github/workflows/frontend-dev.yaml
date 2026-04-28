@@ -15,8 +15,7 @@ on:
 
 env:
   DOCKER_TAGS: juicedollarcom/monitoring-web:beta
-  DEPLOY_SERVICE_JDT: jdt-monitoring-web
-  DEPLOY_SERVICE_JDM: jdm-monitoring-web
+  DEPLOY_SERVICE: jusd-monitoring-web
 
 jobs:
   build:
@@ -61,7 +60,7 @@ jobs:
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2025.4.0/cloudflared-linux-arm64 -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-      - name: Deploy to server (testnet + mainnet)
+      - name: Deploy to server
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.DEPLOY_DEV_SSH_KEY }}" > ~/.ssh/deploy_key
@@ -70,8 +69,4 @@ jobs:
           ssh -i ~/.ssh/deploy_key \
             -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_DEV_HOST }}" \
             ${{ secrets.DEPLOY_DEV_USER }}@${{ secrets.DEPLOY_DEV_HOST }} \
-            "${{ env.DEPLOY_SERVICE_JDT }}"
-          ssh -i ~/.ssh/deploy_key \
-            -o ProxyCommand="cloudflared access ssh --hostname ${{ secrets.DEPLOY_DEV_HOST }}" \
-            ${{ secrets.DEPLOY_DEV_USER }}@${{ secrets.DEPLOY_DEV_HOST }} \
-            "${{ env.DEPLOY_SERVICE_JDM }}"
+            "${{ env.DEPLOY_SERVICE }}"

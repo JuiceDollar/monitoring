@@ -16,9 +16,9 @@ export const EVENT_CONFIG: Record<string, EventConfig> = {
 	PositionDenied: { severity: EventSeverity.LOW, enabled: false },
 
 	// Challenge events
-	ChallengeStarted: { severity: EventSeverity.MEDIUM, enabled: true },
-	ChallengeSucceeded: { severity: EventSeverity.LOW, enabled: false },
-	ChallengeAverted: { severity: EventSeverity.LOW, enabled: false },
+	ChallengeStarted: { severity: EventSeverity.HIGH, enabled: true },
+	ChallengeSucceeded: { severity: EventSeverity.HIGH, enabled: true },
+	ChallengeAverted: { severity: EventSeverity.HIGH, enabled: true },
 
 	// Minter events
 	MinterApplied: { severity: EventSeverity.HIGH, enabled: true },
@@ -39,7 +39,7 @@ export const EVENT_CONFIG: Record<string, EventConfig> = {
 
 	// Profit/Loss events
 	Profit: { severity: EventSeverity.LOW, enabled: false },
-	Loss: { severity: EventSeverity.MEDIUM, enabled: true },
+	Loss: { severity: EventSeverity.HIGH, enabled: true },
 	ProfitDistributed: { severity: EventSeverity.LOW, enabled: false },
 
 	// Savings events
