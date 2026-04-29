@@ -2,6 +2,25 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MonitoringConfig } from './monitoring.config';
 
+const SENSITIVE_KEYS = new Set<string>(['rpcUrl', 'databaseUrl', 'telegramBotToken', 'coingeckoApiKey']);
+
+function redactConfig<T>(config: T): T {
+	return walkRedact(config, '') as T;
+}
+
+function walkRedact(value: unknown, path: string): unknown {
+	if (value && typeof value === 'object' && !Array.isArray(value)) {
+		return Object.fromEntries(
+			Object.entries(value as Record<string, unknown>).map(([key, val]) => {
+				const childPath = path ? `${path}.${key}` : key;
+				if (SENSITIVE_KEYS.has(childPath) && val) return [key, '***'];
+				return [key, walkRedact(val, childPath)];
+			})
+		);
+	}
+	return value;
+}
+
 @Injectable()
 export class AppConfigService {
 	private readonly logger = new Logger(AppConfigService.name);
@@ -10,7 +29,7 @@ export class AppConfigService {
 	constructor(private readonly configService: ConfigService) {
 		this.monitoringConfig = this.configService.get<MonitoringConfig>('monitoring');
 		if (!this.monitoringConfig) throw new Error('Monitoring configuration not found');
-		this.logger.log(`Configuration service initialized: ${JSON.stringify(this.monitoringConfig)}`);
+		this.logger.log(`Configuration service initialized: ${JSON.stringify(redactConfig(this.monitoringConfig))}`);
 	}
 
 	get rpcUrl(): string {
