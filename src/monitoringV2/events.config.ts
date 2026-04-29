@@ -13,7 +13,7 @@ export const EVENT_CONFIG: Record<string, EventConfig> = {
 	// Position events
 	PositionOpened: { severity: EventSeverity.HIGH, enabled: true },
 	MintingUpdate: { severity: EventSeverity.HIGH, enabled: true },
-	PositionDenied: { severity: EventSeverity.LOW, enabled: false },
+	PositionDenied: { severity: EventSeverity.MEDIUM, enabled: true },
 
 	// Challenge events
 	ChallengeStarted: { severity: EventSeverity.HIGH, enabled: true },
