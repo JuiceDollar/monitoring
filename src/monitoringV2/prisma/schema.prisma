@@ -119,6 +119,10 @@ model ChallengeState {
   size         Decimal @db.Decimal(78, 0)
   currentPrice Decimal @map("current_price") @db.Decimal(78, 0)
 
+  // Auction-deadline escalation flags
+  t24Alerted Boolean @default(false) @map("t24_alerted")
+  t2Alerted  Boolean @default(false) @map("t2_alerted")
+
   // Metadata
   timestamp DateTime @db.Timestamptz
 

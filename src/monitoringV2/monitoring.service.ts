@@ -131,6 +131,7 @@ export class MonitoringService implements OnModuleInit {
 		await this.tokenService.syncPrices(); // sync token prices
 		await this.positionService.syncPositions(); // sync position states
 		await this.challengeService.syncChallenges(); // sync challenge states
+		await this.challengeService.checkAuctionDeadlines(); // T-24h / T-2h escalation alerts
 		await this.collateralService.syncCollaterals(); // sync collateral states
 		await this.minterService.syncMinters(); // sync minter states
 		await this.jusdService.syncState(); // sync JUSD global state

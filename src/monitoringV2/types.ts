@@ -117,6 +117,10 @@ export interface ChallengeState {
 	size: bigint;
 	currentPrice: bigint;
 
+	// Auction-deadline escalation flags
+	t24Alerted: boolean;
+	t2Alerted: boolean;
+
 	// Metadata
 	timestamp: Date;
 }
