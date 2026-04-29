@@ -145,12 +145,12 @@ export class TelegramService {
 
 	// Backslash-escaped square brackets so Telegram's Markdown parser renders them literally
 	// instead of interpreting `[…]` as the start of a link. Combines tier tag (env) and
-	// optional chain tag — multi-chain stacks set CHAIN_TAG to render e.g. `[PRD] [JDM]`,
-	// single-chain stacks omit it and render only `[PRD]`.
+	// optional chain — set CHAIN to render e.g. `[PRD] [MAINNET]`, leave unset to
+	// render only `[PRD]`. Either side is omitted if the corresponding env var is unset.
 	private envTag(): string {
-		const env = `\\[${this.config.environment.toUpperCase()}\\]`;
-		const chain = this.config.chainTag ? ` \\[${this.config.chainTag.toUpperCase()}\\]` : '';
-		return `${env}${chain}`;
+		const env = this.config.environment ? `\\[${this.config.environment.toUpperCase()}\\]` : '';
+		const chain = this.config.chain ? `\\[${this.config.chain.toUpperCase()}\\]` : '';
+		return [env, chain].filter((part) => part.length > 0).join(' ');
 	}
 
 	async sendCriticalAlert(message: string): Promise<void> {

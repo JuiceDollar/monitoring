@@ -88,11 +88,11 @@ export class AppConfigService {
 		return this.monitoringConfig.coingeckoApiKey || undefined;
 	}
 
-	get environment(): string {
-		return this.monitoringConfig.environment || 'dev';
+	get environment(): string | undefined {
+		return this.monitoringConfig.environment;
 	}
 
-	get chainTag(): string | undefined {
-		return this.monitoringConfig.chainTag;
+	get chain(): string | undefined {
+		return this.monitoringConfig.chain;
 	}
 }

@@ -77,7 +77,7 @@ export class MonitoringConfig {
 
 	@IsOptional()
 	@IsString()
-	chainTag?: string;
+	chain?: string;
 }
 
 export default registerAs('monitoring', () => {
@@ -100,8 +100,8 @@ export default registerAs('monitoring', () => {
 	config.telegramAlertsEnabled = (process.env.TELEGRAM_ALERTS_ENABLED || 'false').toLowerCase() === 'true';
 	config.alertTimeframeHours = parseInt(process.env.ALERT_TIMEFRAME_HOURS || '12');
 	config.coingeckoApiKey = process.env.COINGECKO_API_KEY || '';
-	config.environment = (process.env.ENVIRONMENT || 'dev').toLowerCase();
-	config.chainTag = process.env.CHAIN_TAG ? process.env.CHAIN_TAG.toLowerCase() : undefined;
+	config.environment = process.env.ENVIRONMENT?.toLowerCase();
+	config.chain = process.env.CHAIN;
 
 	const errors = validateSync(plainToClass(MonitoringConfig, config));
 	if (errors.length > 0) throw new Error(`Config validation failed: ${errors}`);
