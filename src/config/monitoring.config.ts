@@ -74,6 +74,10 @@ export class MonitoringConfig {
 	@IsOptional()
 	@IsString()
 	environment?: string;
+
+	@IsOptional()
+	@IsString()
+	chainTag?: string;
 }
 
 export default registerAs('monitoring', () => {
@@ -97,6 +101,7 @@ export default registerAs('monitoring', () => {
 	config.alertTimeframeHours = parseInt(process.env.ALERT_TIMEFRAME_HOURS || '12');
 	config.coingeckoApiKey = process.env.COINGECKO_API_KEY || '';
 	config.environment = (process.env.ENVIRONMENT || 'dev').toLowerCase();
+	config.chainTag = process.env.CHAIN_TAG ? process.env.CHAIN_TAG.toLowerCase() : undefined;
 
 	const errors = validateSync(plainToClass(MonitoringConfig, config));
 	if (errors.length > 0) throw new Error(`Config validation failed: ${errors}`);

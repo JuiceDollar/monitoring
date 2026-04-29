@@ -91,4 +91,8 @@ export class AppConfigService {
 	get environment(): string {
 		return this.monitoringConfig.environment || 'dev';
 	}
+
+	get chainTag(): string | undefined {
+		return this.monitoringConfig.chainTag;
+	}
 }
