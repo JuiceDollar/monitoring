@@ -122,10 +122,15 @@ export class TelegramService {
 
 	private constructMessage(event: Event, severity: string, time: string): string {
 		const severityIndicator = { HIGH: '🚨', MEDIUM: '', LOW: '' }[severity] || '';
+		const envTag = this.envTag();
 		const argsText = this.formatArgs(event.args);
 
+		const headerParts = [severityIndicator, envTag, `*${event.topic.replace(/([A-Z])/g, ' $1').trim()}*`].filter(
+			(part) => part.length > 0
+		);
+
 		const lines = [
-			`${severityIndicator} *${event.topic.replace(/([A-Z])/g, ' $1').trim()}*`,
+			headerParts.join(' '),
 			'',
 			severity ? `Severity: *${severity}*` : null,
 			`Time: ${time}`,
@@ -138,11 +143,17 @@ export class TelegramService {
 		return lines.join('\n');
 	}
 
+	// Backslash-escaped square brackets so Telegram's Markdown parser renders them literally
+	// instead of interpreting `[…]` as the start of a link.
+	private envTag(): string {
+		return `\\[${this.config.environment.toUpperCase()}\\]`;
+	}
+
 	async sendCriticalAlert(message: string): Promise<void> {
 		if (!this.enabled) return;
 
 		try {
-			const formattedMessage = `🚨 *CRITICAL ALERT*\n\n${message}\n\n_Timestamp: ${new Date().toISOString()}_`;
+			const formattedMessage = `🚨 ${this.envTag()} *CRITICAL ALERT*\n\n${message}\n\n_Timestamp: ${new Date().toISOString()}_`;
 			await this.sendMessage(formattedMessage);
 			this.logger.log('Critical alert sent via Telegram');
 		} catch (error) {

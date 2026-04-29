@@ -87,4 +87,8 @@ export class AppConfigService {
 	get coingeckoApiKey(): string | undefined {
 		return this.monitoringConfig.coingeckoApiKey || undefined;
 	}
+
+	get environment(): string {
+		return this.monitoringConfig.environment || 'dev';
+	}
 }
