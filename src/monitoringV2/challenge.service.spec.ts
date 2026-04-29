@@ -15,12 +15,16 @@ describe('ChallengeService.checkAuctionDeadlines', () => {
 	const HOUR = 3600n;
 	const CHALLENGE_PERIOD = 10n * 86_400n; // 10 days
 
+	const HUB = '0x' + 'a'.repeat(40);
+	const CHALLENGER = '0x' + 'b'.repeat(40);
+	const POSITION = '0x' + 'c'.repeat(40);
+
 	function makeChallenge(overrides: Partial<any> = {}) {
 		return {
 			challengeId: 1,
-			hubAddress: '0xhub',
-			challengerAddress: '0xchallenger',
-			positionAddress: '0xposition',
+			hubAddress: HUB,
+			challengerAddress: CHALLENGER,
+			positionAddress: POSITION,
 			startTimestamp: NOW - 2n * CHALLENGE_PERIOD - 5n * 86_400n, // safely past auction end by default
 			size: 100n,
 			currentPrice: 1000n,
@@ -117,5 +121,18 @@ describe('ChallengeService.checkAuctionDeadlines', () => {
 		challengeRepo.findActiveWithChallengePeriod.mockResolvedValue([]);
 		await service.checkAuctionDeadlines();
 		expect(telegram.sendCriticalAlert).not.toHaveBeenCalled();
+	});
+
+	it('continues to next challenge when DB mark fails for one entry', async () => {
+		const c1 = withRemaining(12n, { challengeId: 1 });
+		const c2 = withRemaining(12n, { challengeId: 2 });
+		challengeRepo.findActiveWithChallengePeriod.mockResolvedValue([c1, c2]);
+		challengeRepo.markT24Alerted
+			.mockRejectedValueOnce(new Error('transient db error'))
+			.mockResolvedValueOnce(undefined);
+		await service.checkAuctionDeadlines();
+		// First challenge errored on mark, second still gets its alert + mark
+		expect(telegram.sendCriticalAlert).toHaveBeenCalledTimes(2);
+		expect(challengeRepo.markT24Alerted).toHaveBeenCalledTimes(2);
 	});
 });

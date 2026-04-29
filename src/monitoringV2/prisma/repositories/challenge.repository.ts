@@ -92,28 +92,49 @@ export class ChallengeRepository {
 				current_price: any;
 				t24_alerted: boolean;
 				t2_alerted: boolean;
-				challenge_period: bigint;
+				challenge_period: bigint | null;
 			}>
 		>`
 			SELECT c.challenge_id, c.hub_address, c.challenger_address, c.position_address,
 			       c.start_timestamp, c.size, c.current_price, c.t24_alerted, c.t2_alerted,
 			       p.challenge_period
 			FROM challenge_states c
-			JOIN position_states p ON p.address = c.position_address
+			LEFT JOIN position_states p ON p.address = c.position_address
 			WHERE c.size > 0
 		`;
-		return rows.map((r) => ({
-			challengeId: r.challenge_id,
-			hubAddress: r.hub_address,
-			challengerAddress: r.challenger_address,
-			positionAddress: r.position_address,
-			startTimestamp: BigInt(r.start_timestamp),
-			size: BigInt(r.size.toString()),
-			currentPrice: BigInt(r.current_price.toString()),
-			t24Alerted: r.t24_alerted,
-			t2Alerted: r.t2_alerted,
-			challengePeriod: BigInt(r.challenge_period),
-		}));
+		const result: Array<{
+			challengeId: number;
+			hubAddress: string;
+			challengerAddress: string;
+			positionAddress: string;
+			startTimestamp: bigint;
+			size: bigint;
+			currentPrice: bigint;
+			t24Alerted: boolean;
+			t2Alerted: boolean;
+			challengePeriod: bigint;
+		}> = [];
+		for (const r of rows) {
+			if (r.challenge_period === null) {
+				this.logger.warn(
+					`Active challenge #${r.challenge_id} on ${r.hub_address} references unknown position ${r.position_address}; skipped`
+				);
+				continue;
+			}
+			result.push({
+				challengeId: r.challenge_id,
+				hubAddress: r.hub_address,
+				challengerAddress: r.challenger_address,
+				positionAddress: r.position_address,
+				startTimestamp: BigInt(r.start_timestamp),
+				size: BigInt(r.size.toString()),
+				currentPrice: BigInt(r.current_price.toString()),
+				t24Alerted: r.t24_alerted,
+				t2Alerted: r.t2_alerted,
+				challengePeriod: BigInt(r.challenge_period),
+			});
+		}
+		return result;
 	}
 
 	async markT24Alerted(challengeId: number, hubAddress: string): Promise<void> {

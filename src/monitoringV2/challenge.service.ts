@@ -120,21 +120,26 @@ export class ChallengeService {
 		const now = BigInt(Math.floor(Date.now() / 1000));
 
 		for (const c of challenges) {
-			const auctionEnd = c.startTimestamp + 2n * c.challengePeriod;
-			const remaining = auctionEnd - now;
-			if (remaining <= 0n) continue;
+			try {
+				const auctionEnd = c.startTimestamp + 2n * c.challengePeriod;
+				const remaining = auctionEnd - now;
+				if (remaining <= 0n) continue;
 
-			if (remaining <= ChallengeService.T2_SECONDS && !c.t2Alerted) {
-				await this.sendDeadlineAlert(c, '2h', remaining, auctionEnd);
-				await this.challengeRepo.markT2Alerted(c.challengeId, c.hubAddress);
-				if (!c.t24Alerted) {
+				if (remaining <= ChallengeService.T2_SECONDS && !c.t2Alerted) {
+					await this.sendDeadlineAlert(c, '2h', remaining, auctionEnd);
+					await this.challengeRepo.markT2Alerted(c.challengeId, c.hubAddress);
+					if (!c.t24Alerted) {
+						await this.challengeRepo.markT24Alerted(c.challengeId, c.hubAddress);
+					}
+					continue;
+				}
+				if (remaining <= ChallengeService.T24_SECONDS && !c.t24Alerted) {
+					await this.sendDeadlineAlert(c, '24h', remaining, auctionEnd);
 					await this.challengeRepo.markT24Alerted(c.challengeId, c.hubAddress);
 				}
-				continue;
-			}
-			if (remaining <= ChallengeService.T24_SECONDS && !c.t24Alerted) {
-				await this.sendDeadlineAlert(c, '24h', remaining, auctionEnd);
-				await this.challengeRepo.markT24Alerted(c.challengeId, c.hubAddress);
+			} catch (error) {
+				const msg = (error as { message?: string })?.message ?? String(error);
+				this.logger.warn(`Watchdog skipped challenge #${c.challengeId} on ${c.hubAddress}: ${msg}`);
 			}
 		}
 	}
