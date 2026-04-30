@@ -135,11 +135,14 @@ export class MonitoringService implements OnModuleInit {
 		await this.collateralService.syncCollaterals(); // sync collateral states
 		await this.minterService.syncMinters(); // sync minter states
 		await this.jusdService.syncState(); // sync JUSD global state
-		await this.positionService.checkMiniLifetimeClones(this.telegramService); // suspicious short-lifetime clones
-		await this.positionService.checkSuspiciousLiqPrice(this.telegramService); // liq-price/spot/value/challengeability sanity
-		await this.positionService.checkExpiringSoon(this.telegramService); // 24h heads-up before expiration
-		await this.positionService.checkExpired(this.telegramService); // transition into expired status
-		await this.positionService.checkExpiredInPhase2(this.telegramService); // phase 2 of forced-sale decay
+		// Watchers wrapped individually so a bug in one cannot mask the alerts of the others.
+		// A throwing watcher is logged and the cycle continues; the outer try/catch is reserved
+		// for genuine sync-pipeline failures that need the consecutive-failures escalation.
+		await this.runWatcher('checkMiniLifetimeClones', () => this.positionService.checkMiniLifetimeClones(this.telegramService));
+		await this.runWatcher('checkSuspiciousLiqPrice', () => this.positionService.checkSuspiciousLiqPrice(this.telegramService));
+		await this.runWatcher('checkExpiringSoon', () => this.positionService.checkExpiringSoon(this.telegramService));
+		await this.runWatcher('checkExpired', () => this.positionService.checkExpired(this.telegramService));
+		await this.runWatcher('checkExpiredInPhase2', () => this.positionService.checkExpiredInPhase2(this.telegramService));
 		await this.telegramService.sendPendingAlerts(); // send pending telegram alerts
 
 		// Mark full cycle as completed
@@ -159,5 +162,21 @@ export class MonitoringService implements OnModuleInit {
 			this.consecutiveFailures > 0 &&
 			(this.consecutiveFailures === 3 || this.consecutiveFailures === 12 || this.consecutiveFailures % 72 === 0) // ~ 6 hour heartbeat
 		);
+	}
+
+	/**
+	 * Run a watcher with isolated error handling: exceptions are logged with context
+	 * and swallowed so the sibling watchers in the same cycle still get to run. The
+	 * outer scheduler try/catch is reserved for sync-pipeline failures that warrant
+	 * the consecutive-failures escalation; one watcher silently failing should not
+	 * trigger the same path or block the others.
+	 */
+	private async runWatcher(name: string, fn: () => Promise<void>): Promise<void> {
+		try {
+			await fn();
+		} catch (error) {
+			const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
+			this.logger.error(`Watcher ${name} failed: ${errorMsg}`, error?.stack || error);
+		}
 	}
 }
