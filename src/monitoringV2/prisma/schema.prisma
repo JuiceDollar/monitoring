@@ -95,6 +95,13 @@ model PositionState {
   isClosed              Boolean @map("is_closed")
   isDenied              Boolean @default(false) @map("is_denied")
 
+  // Alert dedup: timestamps of last sent alerts to avoid spam across cycles
+  miniLifetimeAlertedAt       BigInt? @map("mini_lifetime_alerted_at") // Unix seconds
+  expiringSoonAlertedAt       BigInt? @map("expiring_soon_alerted_at") // Unix seconds
+  expiredAlertedAt            BigInt? @map("expired_alerted_at") // Unix seconds
+  phase2AlertedAt             BigInt? @map("phase2_alerted_at") // Unix seconds
+  suspiciousLiqPriceAlertedAt BigInt? @map("suspicious_liq_price_alerted_at") // Unix seconds
+
   // Metadata
   timestamp DateTime @db.Timestamptz
 
