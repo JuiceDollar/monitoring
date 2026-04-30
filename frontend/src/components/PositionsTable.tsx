@@ -76,9 +76,10 @@ export function PositionsTable({ data }: PositionsTableProps) {
 			header: { primary: 'COLLATERAL', secondary: 'BALANCE' },
 			align: Alignment.RIGHT,
 			format: (position): MultiLineCell => {
+				const isBtc = position.collateralSymbol.toUpperCase().includes('BTC');
 				return {
 					primary: <AddressLink address={position.collateral} label={position.collateralSymbol} />,
-					secondary: formatNumber(Number(position.collateralBalance)),
+					secondary: formatNumber(Number(position.collateralBalance), 0, isBtc ? 4 : 2),
 				};
 			},
 		},
