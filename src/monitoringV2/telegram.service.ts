@@ -1,16 +1,29 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { Event } from './types';
 import { EVENT_CONFIG, EventSeverity } from './events.config';
 import { PositionRepository } from './prisma/repositories/position.repository';
 import { EventsRepository } from './prisma/repositories/events.repository';
 import { AppConfigService } from 'src/config/config.service';
+import TelegramBot from 'node-telegram-bot-api';
+import { promises as fs } from 'fs';
+
+interface TelegramGroupState {
+	apiVersion: string;
+	createdAt: number;
+	updatedAt: number;
+	groups: string[];
+}
+
+const COMMAND_HANDLES = ['/start', '/subscribe', '/unsubscribe', '/help'];
 
 @Injectable()
-export class TelegramService {
+export class TelegramService implements OnModuleInit, OnModuleDestroy {
 	private readonly logger = new Logger(TelegramService.name);
 	private readonly botToken: string;
-	private readonly chatId: string;
+	private readonly groupsJsonPath: string | undefined;
 	private readonly enabled: boolean;
+	private bot: TelegramBot | undefined;
+	private groupState: TelegramGroupState = { apiVersion: '1.0.0', createdAt: 0, updatedAt: 0, groups: [] };
 
 	constructor(
 		private readonly config: AppConfigService,
@@ -18,9 +31,23 @@ export class TelegramService {
 		private readonly eventsRepo: EventsRepository
 	) {
 		this.botToken = this.config.telegramBotToken;
-		this.chatId = this.config.telegramChatId;
-		this.enabled = this.config.telegramAlertsEnabled && !!this.botToken && !!this.chatId;
+		this.groupsJsonPath = this.config.telegramGroupsJson;
+		this.enabled = this.config.telegramAlertsEnabled && !!this.botToken && !!this.groupsJsonPath;
 		this.logger.log(`Telegram notifications are ${this.enabled ? 'ENABLED' : 'DISABLED'}`);
+	}
+
+	async onModuleInit(): Promise<void> {
+		if (!this.enabled) return;
+		await this.loadGroupState();
+		this.bot = new TelegramBot(this.botToken, { polling: true });
+		this.applyListener();
+		this.logger.log(`Telegram bot polling started (${this.groupState.groups.length} subscriber(s))`);
+	}
+
+	async onModuleDestroy(): Promise<void> {
+		if (this.bot) {
+			await this.bot.stopPolling().catch(() => undefined);
+		}
 	}
 
 	async sendPendingAlerts(): Promise<void> {
@@ -51,13 +78,11 @@ export class TelegramService {
 
 		try {
 			const message = this.constructMessage(event, severity, time);
-			await this.sendMessage(message);
+			return await this.broadcast(message);
 		} catch (error) {
 			this.logger.error(`Failed to send Telegram message for event ${event.topic}: ${error.message}`);
 			return false;
 		}
-
-		return true;
 	}
 
 	private async getDynamicSeverity(event: Event, severity: EventSeverity): Promise<EventSeverity> {
@@ -83,28 +108,26 @@ export class TelegramService {
 		return `${day} at ${time} UTC`;
 	}
 
-	private async sendMessage(text: string): Promise<void> {
-		const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;
+	/**
+	 * Deliver to every subscribed chat. Returns true iff at least one delivery succeeded;
+	 * per-chat failures (user blocked the bot, chat deleted, transient API error) are logged
+	 * and skipped so a single bad chat does not suppress the entire alert. Disabled bot
+	 * (config / no token / no subscribers) returns false.
+	 */
+	private async broadcast(text: string): Promise<boolean> {
+		if (!this.enabled || !this.bot || this.groupState.groups.length === 0) return false;
 
-		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), 10000);
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				chat_id: this.chatId,
-				text,
-				parse_mode: 'Markdown',
-				disable_web_page_preview: true,
-			}),
-			signal: controller.signal,
-		});
-		clearTimeout(timeout);
-
-		if (!response.ok) {
-			const error = await response.text();
-			throw new Error(`Telegram API error: ${error}`);
+		let anyDelivered = false;
+		for (const chatId of this.groupState.groups) {
+			try {
+				await this.bot.sendMessage(chatId, text, { parse_mode: 'Markdown', disable_web_page_preview: true });
+				anyDelivered = true;
+			} catch (error) {
+				this.logger.warn(`Telegram delivery to chat ${chatId} failed: ${error.message ?? error}`);
+			}
+			await this.sleep(50); // stay under per-bot rate limit (~30 msg/s)
 		}
+		return anyDelivered;
 	}
 
 	// Helper functions
@@ -154,22 +177,106 @@ export class TelegramService {
 	}
 
 	/**
-	 * Send a critical alert. Returns true only on confirmed delivery. Returns false when
-	 * telegram is disabled or on Telegram API failure (429, network drop, parse error) so
-	 * callers do not persist "alerted" state — positions stay unalerted in the DB and are
-	 * retried every cycle until delivery succeeds.
+	 * Send a critical alert to every subscriber. Returns true only on confirmed delivery to
+	 * at least one chat. Returns false when telegram is disabled, no subscribers exist, or
+	 * every send failed — callers can then decide not to persist "alerted" state and retry
+	 * on the next cycle.
 	 */
 	async sendCriticalAlert(message: string): Promise<boolean> {
 		if (!this.enabled) return false;
 
+		const formattedMessage = `🚨 ${this.envTag()} *CRITICAL ALERT*\n\n${message}\n\n_Timestamp: ${new Date().toISOString()}_`;
+		const delivered = await this.broadcast(formattedMessage);
+		if (delivered) this.logger.log('Critical alert sent via Telegram');
+		return delivered;
+	}
+
+	// --- Subscriber management ---------------------------------------------------------
+
+	private applyListener(): void {
+		if (!this.bot) return;
+		this.bot.on('message', async (msg) => {
+			const text = msg.text;
+			if (!text || !COMMAND_HANDLES.includes(text)) return;
+			const chatId = msg.chat.id.toString();
+			switch (text) {
+				case '/start':
+				case '/subscribe':
+					await this.handleSubscribe(chatId);
+					break;
+				case '/unsubscribe':
+					await this.handleUnsubscribe(chatId);
+					break;
+				case '/help':
+					await this.handleHelp(chatId);
+					break;
+			}
+		});
+		this.bot.on('polling_error', (err) => {
+			this.logger.warn(`Polling error: ${err.message ?? err}`);
+		});
+	}
+
+	private async handleSubscribe(chatId: string): Promise<void> {
+		if (this.groupState.groups.includes(chatId)) {
+			await this.bot?.sendMessage(chatId, 'You are already subscribed.');
+			return;
+		}
+		this.groupState.groups.push(chatId);
+		await this.writeGroupState();
+		await this.bot?.sendMessage(chatId, 'You are now subscribed. Use /unsubscribe to stop.');
+		this.logger.log(`Subscribed chat ${chatId} (total: ${this.groupState.groups.length})`);
+	}
+
+	private async handleUnsubscribe(chatId: string): Promise<void> {
+		if (!this.groupState.groups.includes(chatId)) {
+			await this.bot?.sendMessage(chatId, 'You are not subscribed.');
+			return;
+		}
+		this.groupState.groups = this.groupState.groups.filter((g) => g !== chatId);
+		await this.writeGroupState();
+		await this.bot?.sendMessage(chatId, 'You are not subscribed anymore.');
+		this.logger.log(`Unsubscribed chat ${chatId} (total: ${this.groupState.groups.length})`);
+	}
+
+	private async handleHelp(chatId: string): Promise<void> {
+		const lines = [
+			'*Available commands:*',
+			'/start or /subscribe — receive alerts in this chat',
+			'/unsubscribe — stop receiving alerts',
+			'/help — show this message',
+		];
+		await this.bot?.sendMessage(chatId, lines.join('\n'), { parse_mode: 'Markdown' });
+	}
+
+	private async loadGroupState(): Promise<void> {
+		if (!this.groupsJsonPath) return;
 		try {
-			const formattedMessage = `🚨 ${this.envTag()} *CRITICAL ALERT*\n\n${message}\n\n_Timestamp: ${new Date().toISOString()}_`;
-			await this.sendMessage(formattedMessage);
-			this.logger.log('Critical alert sent via Telegram');
-			return true;
-		} catch (error) {
-			this.logger.error(`Failed to send critical Telegram alert: ${error.message}`);
-			return false;
+			const raw = await fs.readFile(this.groupsJsonPath, 'utf-8');
+			const parsed: TelegramGroupState = JSON.parse(raw);
+			this.groupState = {
+				apiVersion: parsed.apiVersion ?? '1.0.0',
+				createdAt: parsed.createdAt ?? 0,
+				updatedAt: parsed.updatedAt ?? 0,
+				groups: Array.isArray(parsed.groups) ? parsed.groups : [],
+			};
+		} catch (err: any) {
+			if (err?.code !== 'ENOENT') {
+				this.logger.warn(`Could not read groups file ${this.groupsJsonPath}: ${err.message ?? err}`);
+			}
+			// Fresh state — first start, will be created on first subscribe
+			this.groupState = { apiVersion: '1.0.0', createdAt: Date.now(), updatedAt: Date.now(), groups: [] };
+		}
+	}
+
+	private async writeGroupState(): Promise<void> {
+		if (!this.groupsJsonPath) return;
+		this.groupState.updatedAt = Date.now();
+		if (!this.groupState.createdAt) this.groupState.createdAt = Date.now();
+		try {
+			await fs.writeFile(this.groupsJsonPath, JSON.stringify(this.groupState), 'utf-8');
+		} catch (err: any) {
+			this.logger.error(`Failed to persist groups file ${this.groupsJsonPath}: ${err.message ?? err}`);
 		}
 	}
 
