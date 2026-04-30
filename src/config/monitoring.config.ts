@@ -1,5 +1,5 @@
 import { registerAs } from '@nestjs/config';
-import { IsString, IsNumber, IsOptional, IsUrl, Min, Max, validateSync, IsBoolean } from 'class-validator';
+import { IsString, IsNumber, IsOptional, IsUrl, Min, Max, validateSync, IsBoolean, IsArray } from 'class-validator';
 import { Transform, plainToClass } from 'class-transformer';
 
 export class MonitoringConfig {
@@ -55,8 +55,9 @@ export class MonitoringConfig {
 	telegramBotToken?: string;
 
 	@IsOptional()
-	@IsString()
-	telegramChatId?: string;
+	@IsArray()
+	@IsString({ each: true })
+	telegramChatIds?: string[];
 
 	@IsOptional()
 	@IsBoolean()
@@ -96,7 +97,9 @@ export default registerAs('monitoring', () => {
 	config.rpcTimeoutMs = parseInt(process.env.RPC_TIMEOUT_MS || '60000');
 
 	config.telegramBotToken = process.env.TELEGRAM_BOT_TOKEN || '';
-	config.telegramChatId = process.env.TELEGRAM_CHAT_ID || '';
+	config.telegramChatIds = process.env.TELEGRAM_CHAT_IDS?.split(',')
+		.map((id) => id.trim())
+		.filter((id) => id.length > 0);
 	config.telegramAlertsEnabled = (process.env.TELEGRAM_ALERTS_ENABLED || 'false').toLowerCase() === 'true';
 	config.alertTimeframeHours = parseInt(process.env.ALERT_TIMEFRAME_HOURS || '12');
 	config.coingeckoApiKey = process.env.COINGECKO_API_KEY || '';

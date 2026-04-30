@@ -9,7 +9,7 @@ import { AppConfigService } from 'src/config/config.service';
 export class TelegramService {
 	private readonly logger = new Logger(TelegramService.name);
 	private readonly botToken: string;
-	private readonly chatId: string;
+	private readonly chatIds: string[];
 	private readonly enabled: boolean;
 
 	constructor(
@@ -18,9 +18,12 @@ export class TelegramService {
 		private readonly eventsRepo: EventsRepository
 	) {
 		this.botToken = this.config.telegramBotToken;
-		this.chatId = this.config.telegramChatId;
-		this.enabled = this.config.telegramAlertsEnabled && !!this.botToken && !!this.chatId;
-		this.logger.log(`Telegram notifications are ${this.enabled ? 'ENABLED' : 'DISABLED'}`);
+		this.chatIds = this.config.telegramChatIds ?? [];
+		this.enabled = this.config.telegramAlertsEnabled && !!this.botToken && this.chatIds.length > 0;
+		this.logger.log(
+			`Telegram notifications are ${this.enabled ? 'ENABLED' : 'DISABLED'}` +
+				(this.enabled ? ` (${this.chatIds.length} recipient${this.chatIds.length === 1 ? '' : 's'})` : '')
+		);
 	}
 
 	async sendPendingAlerts(): Promise<void> {
@@ -83,27 +86,39 @@ export class TelegramService {
 		return `${day} at ${time} UTC`;
 	}
 
+	/**
+	 * Deliver to every configured chat. Throws on the first failed delivery so the
+	 * caller can react identically to the previous single-recipient behaviour. Recipients
+	 * are processed sequentially with a small throttle to stay under Telegram's per-bot
+	 * rate limit even when bursting alerts to several operators.
+	 */
 	private async sendMessage(text: string): Promise<void> {
-		const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;
+		for (let i = 0; i < this.chatIds.length; i++) {
+			const chatId = this.chatIds[i];
+			const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;
 
-		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), 10000);
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				chat_id: this.chatId,
-				text,
-				parse_mode: 'Markdown',
-				disable_web_page_preview: true,
-			}),
-			signal: controller.signal,
-		});
-		clearTimeout(timeout);
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 10000);
+			const response = await fetch(url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					chat_id: chatId,
+					text,
+					parse_mode: 'Markdown',
+					disable_web_page_preview: true,
+				}),
+				signal: controller.signal,
+			});
+			clearTimeout(timeout);
 
-		if (!response.ok) {
-			const error = await response.text();
-			throw new Error(`Telegram API error: ${error}`);
+			if (!response.ok) {
+				const error = await response.text();
+				throw new Error(`Telegram API error for chat ${chatId}: ${error}`);
+			}
+
+			// Throttle between recipients to respect the per-bot rate limit (~30 msg/s).
+			if (i < this.chatIds.length - 1) await this.sleep(50);
 		}
 	}
 

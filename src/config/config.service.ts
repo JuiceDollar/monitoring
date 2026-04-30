@@ -72,8 +72,8 @@ export class AppConfigService {
 		return this.monitoringConfig.telegramBotToken;
 	}
 
-	get telegramChatId(): string | undefined {
-		return this.monitoringConfig.telegramChatId;
+	get telegramChatIds(): string[] | undefined {
+		return this.monitoringConfig.telegramChatIds;
 	}
 
 	get telegramAlertsEnabled(): boolean {
