@@ -56,7 +56,7 @@ export class MonitoringConfig {
 
 	@IsOptional()
 	@IsString()
-	telegramChatId?: string;
+	telegramGroupsJson?: string;
 
 	@IsOptional()
 	@IsBoolean()
@@ -96,7 +96,7 @@ export default registerAs('monitoring', () => {
 	config.rpcTimeoutMs = parseInt(process.env.RPC_TIMEOUT_MS || '60000');
 
 	config.telegramBotToken = process.env.TELEGRAM_BOT_TOKEN || '';
-	config.telegramChatId = process.env.TELEGRAM_CHAT_ID || '';
+	config.telegramGroupsJson = process.env.TELEGRAM_GROUPS_JSON;
 	config.telegramAlertsEnabled = (process.env.TELEGRAM_ALERTS_ENABLED || 'false').toLowerCase() === 'true';
 	config.alertTimeframeHours = parseInt(process.env.ALERT_TIMEFRAME_HOURS || '12');
 	config.coingeckoApiKey = process.env.COINGECKO_API_KEY || '';
