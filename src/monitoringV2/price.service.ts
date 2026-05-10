@@ -61,8 +61,8 @@ export class PriceService {
 		private readonly telegramService: TelegramService
 	) {
 		this.CACHE_TTL_MS = this.appConfigService.priceCacheTtlMs;
-		if (!this.appConfigService.coingeckoBaseUrl && !this.appConfigService.coingeckoApiKey) {
-			throw new Error('CoinGecko is not configured: set COINGECKO_BASE_URL or COINGECKO_API_KEY');
+		if (!this.appConfigService.coingeckoBaseUrl) {
+			throw new Error('COINGECKO_BASE_URL is not set');
 		}
 	}
 
@@ -110,32 +110,17 @@ export class PriceService {
 	}
 
 	/**
-	 * Resolve which CoinGecko endpoint and authentication header to use.
-	 *
-	 * Two modes, in priority order:
-	 *  1. `COINGECKO_BASE_URL` set → trust the caller (typically a pricing proxy
-	 *     that injects the upstream key itself); send no auth header.
-	 *  2. `COINGECKO_API_KEY` set → Pro tier: pro-api.coingecko.com with
-	 *     `x-cg-pro-api-key`.
-	 *
-	 * Bootstrap (see onModuleInit) refuses to start the service when neither
-	 * is set, so this method does not need to fall back to the anonymous
-	 * public endpoint — silent anonymous mode would mask a misconfiguration
-	 * and would route prices through the IP-shared quota that already proved
-	 * fragile in production.
+	 * Resolve the CoinGecko endpoint. The service is always pointed at the
+	 * in-cluster pricing proxy via `COINGECKO_BASE_URL`; the proxy holds the
+	 * upstream key and validates upstream errors. The constructor refuses to
+	 * start without that env var, so this method only has the one path.
 	 */
 	private resolveCoingeckoEndpoint(): CoingeckoEndpoint {
-		const headers: Record<string, string> = { accept: 'application/json' };
-		const explicitBase = this.appConfigService.coingeckoBaseUrl;
-		if (explicitBase) {
-			return { baseUrl: explicitBase, headers };
+		const baseUrl = this.appConfigService.coingeckoBaseUrl;
+		if (!baseUrl) {
+			throw new Error('COINGECKO_BASE_URL is not set');
 		}
-		const apiKey = this.appConfigService.coingeckoApiKey;
-		if (apiKey) {
-			headers['x-cg-pro-api-key'] = apiKey;
-			return { baseUrl: 'https://pro-api.coingecko.com', headers };
-		}
-		throw new Error('CoinGecko is not configured: set COINGECKO_BASE_URL or COINGECKO_API_KEY');
+		return { baseUrl, headers: { accept: 'application/json' } };
 	}
 
 	private async getBtcPriceInUsd(): Promise<string | null> {
@@ -186,20 +171,12 @@ export class PriceService {
 	}
 
 	/**
-	 * Daily probe of /api/v3/key. Emits a critical alert when the monthly
-	 * remaining call credit drops below QUOTA_REMAINING_ALERT_THRESHOLD.
-	 *
-	 * Routes through the same endpoint resolution as price calls so a proxy
-	 * deployment (key held only by the proxy) is still covered. Skipped only
-	 * when the service runs fully anonymous (no proxy and no key) — in that
-	 * case there is no Pro account to monitor.
+	 * Daily probe of /api/v3/key through the pricing proxy. Emits a critical
+	 * alert when the monthly remaining call credit drops below
+	 * QUOTA_REMAINING_ALERT_THRESHOLD.
 	 */
 	@Cron(CronExpression.EVERY_DAY_AT_NOON)
 	async checkCoingeckoQuota(): Promise<void> {
-		const explicitBase = this.appConfigService.coingeckoBaseUrl;
-		const apiKey = this.appConfigService.coingeckoApiKey;
-		if (!explicitBase && !apiKey) return;
-
 		try {
 			const { baseUrl, headers } = this.resolveCoingeckoEndpoint();
 			const response = await axios.get<CoingeckoKeyInfo>(`${baseUrl}/api/v3/key`, {

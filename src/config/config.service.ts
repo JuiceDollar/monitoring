@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MonitoringConfig } from './monitoring.config';
 
-const SENSITIVE_KEYS = new Set<string>(['rpcUrl', 'databaseUrl', 'telegramBotToken', 'coingeckoApiKey']);
+const SENSITIVE_KEYS = new Set<string>(['rpcUrl', 'databaseUrl', 'telegramBotToken']);
 
 function redactConfig<T>(config: T): T {
 	return walkRedact(config, '') as T;
@@ -82,10 +82,6 @@ export class AppConfigService {
 
 	get alertTimeframeHours(): number {
 		return this.monitoringConfig.alertTimeframeHours || 12;
-	}
-
-	get coingeckoApiKey(): string | undefined {
-		return this.monitoringConfig.coingeckoApiKey || undefined;
 	}
 
 	get coingeckoBaseUrl(): string | undefined {
