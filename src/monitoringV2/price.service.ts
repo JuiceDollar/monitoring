@@ -110,17 +110,30 @@ export class PriceService {
 	}
 
 	/**
-	 * Resolve the CoinGecko endpoint. The service is always pointed at the
-	 * in-cluster pricing proxy via `COINGECKO_BASE_URL`; the proxy holds the
-	 * upstream key and validates upstream errors. The constructor refuses to
-	 * start without that env var, so this method only has the one path.
+	 * Resolve the CoinGecko endpoint.
+	 *
+	 * `COINGECKO_BASE_URL` is required and points at the origin the service
+	 * talks to — typically the in-cluster pricing-proxy
+	 * (https://github.com/DFXswiss/pricing-proxy), but any CoinGecko-compatible
+	 * origin works (e.g. `https://pro-api.coingecko.com` or
+	 * `https://api.coingecko.com`).
+	 *
+	 * `COINGECKO_API_KEY` is optional and is attached as the
+	 * `x-cg-pro-api-key` header on every request when set. Leave it unset when
+	 * talking to the pricing-proxy (the proxy injects its own key) or when
+	 * hitting the public host anonymously.
 	 */
 	private resolveCoingeckoEndpoint(): CoingeckoEndpoint {
 		const baseUrl = this.appConfigService.coingeckoBaseUrl;
 		if (!baseUrl) {
 			throw new Error('COINGECKO_BASE_URL is not set');
 		}
-		return { baseUrl, headers: { accept: 'application/json' } };
+		const headers: Record<string, string> = { accept: 'application/json' };
+		const apiKey = this.appConfigService.coingeckoApiKey;
+		if (apiKey) {
+			headers['x-cg-pro-api-key'] = apiKey;
+		}
+		return { baseUrl, headers };
 	}
 
 	private async getBtcPriceInUsd(): Promise<string | null> {
