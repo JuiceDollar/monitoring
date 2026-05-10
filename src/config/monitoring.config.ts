@@ -73,6 +73,10 @@ export class MonitoringConfig {
 
 	@IsOptional()
 	@IsString()
+	coingeckoBaseUrl?: string;
+
+	@IsOptional()
+	@IsString()
 	environment?: string;
 
 	@IsOptional()
@@ -100,6 +104,7 @@ export default registerAs('monitoring', () => {
 	config.telegramAlertsEnabled = (process.env.TELEGRAM_ALERTS_ENABLED || 'false').toLowerCase() === 'true';
 	config.alertTimeframeHours = parseInt(process.env.ALERT_TIMEFRAME_HOURS || '12');
 	config.coingeckoApiKey = process.env.COINGECKO_API_KEY || '';
+	config.coingeckoBaseUrl = process.env.COINGECKO_BASE_URL || '';
 	config.environment = process.env.ENVIRONMENT?.toLowerCase();
 	config.chain = process.env.CHAIN;
 
