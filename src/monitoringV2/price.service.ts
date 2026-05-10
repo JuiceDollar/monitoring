@@ -61,6 +61,9 @@ export class PriceService {
 		private readonly telegramService: TelegramService
 	) {
 		this.CACHE_TTL_MS = this.appConfigService.priceCacheTtlMs;
+		if (!this.appConfigService.coingeckoBaseUrl && !this.appConfigService.coingeckoApiKey) {
+			throw new Error('CoinGecko is not configured: set COINGECKO_BASE_URL or COINGECKO_API_KEY');
+		}
 	}
 
 	registerWcbtcAddress(address: string): void {
@@ -109,14 +112,17 @@ export class PriceService {
 	/**
 	 * Resolve which CoinGecko endpoint and authentication header to use.
 	 *
-	 * Three modes, in priority order:
+	 * Two modes, in priority order:
 	 *  1. `COINGECKO_BASE_URL` set → trust the caller (typically a pricing proxy
 	 *     that injects the upstream key itself); send no auth header.
 	 *  2. `COINGECKO_API_KEY` set → Pro tier: pro-api.coingecko.com with
-	 *     `x-cg-pro-api-key`. The earlier mix of public host + demo header is
-	 *     wrong for Pro keys and gets the calls counted against the anonymous
-	 *     IP-shared quota, producing 429s.
-	 *  3. Otherwise → unauthenticated public endpoint.
+	 *     `x-cg-pro-api-key`.
+	 *
+	 * Bootstrap (see onModuleInit) refuses to start the service when neither
+	 * is set, so this method does not need to fall back to the anonymous
+	 * public endpoint — silent anonymous mode would mask a misconfiguration
+	 * and would route prices through the IP-shared quota that already proved
+	 * fragile in production.
 	 */
 	private resolveCoingeckoEndpoint(): CoingeckoEndpoint {
 		const headers: Record<string, string> = { accept: 'application/json' };
@@ -129,7 +135,7 @@ export class PriceService {
 			headers['x-cg-pro-api-key'] = apiKey;
 			return { baseUrl: 'https://pro-api.coingecko.com', headers };
 		}
-		return { baseUrl: 'https://api.coingecko.com', headers };
+		throw new Error('CoinGecko is not configured: set COINGECKO_BASE_URL or COINGECKO_API_KEY');
 	}
 
 	private async getBtcPriceInUsd(): Promise<string | null> {
