@@ -64,6 +64,9 @@ export class PriceService {
 		if (!this.appConfigService.coingeckoBaseUrl) {
 			throw new Error('COINGECKO_BASE_URL is not set');
 		}
+		if (!this.appConfigService.geckoTerminalBaseUrl) {
+			throw new Error('GECKOTERMINAL_BASE_URL is not set');
+		}
 	}
 
 	registerWcbtcAddress(address: string): void {
@@ -225,7 +228,7 @@ export class PriceService {
 		const remaining = addresses.filter((addr) => !cached[addr]);
 		if (remaining.length === 0) return cached;
 
-		const baseUrl = this.appConfigService.geckoTerminalBaseUrl ?? 'https://api.geckoterminal.com';
+		const baseUrl = this.appConfigService.geckoTerminalBaseUrl;
 
 		try {
 			const response = await axios.get<TokenPrice>(
