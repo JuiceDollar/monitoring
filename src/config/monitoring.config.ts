@@ -77,6 +77,10 @@ export class MonitoringConfig {
 
 	@IsOptional()
 	@IsString()
+	geckoTerminalBaseUrl?: string;
+
+	@IsOptional()
+	@IsString()
 	environment?: string;
 
 	@IsOptional()
@@ -105,6 +109,7 @@ export default registerAs('monitoring', () => {
 	config.alertTimeframeHours = parseInt(process.env.ALERT_TIMEFRAME_HOURS || '12');
 	config.coingeckoBaseUrl = process.env.COINGECKO_BASE_URL || '';
 	config.coingeckoApiKey = process.env.COINGECKO_API_KEY || '';
+	config.geckoTerminalBaseUrl = process.env.GECKOTERMINAL_BASE_URL || '';
 	config.environment = process.env.ENVIRONMENT?.toLowerCase();
 	config.chain = process.env.CHAIN;
 
