@@ -225,9 +225,11 @@ export class PriceService {
 		const remaining = addresses.filter((addr) => !cached[addr]);
 		if (remaining.length === 0) return cached;
 
+		const baseUrl = this.appConfigService.geckoTerminalBaseUrl ?? 'https://api.geckoterminal.com';
+
 		try {
 			const response = await axios.get<TokenPrice>(
-				`https://api.geckoterminal.com/api/v2/simple/networks/citrea/token_price/${remaining.map((a) => a.toLowerCase()).join(',')}`,
+				`${baseUrl}/api/v2/simple/networks/citrea/token_price/${remaining.map((a) => a.toLowerCase()).join(',')}`,
 				{
 					headers: { accept: 'application/json' },
 					timeout: 10000,
