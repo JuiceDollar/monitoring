@@ -92,6 +92,10 @@ export class AppConfigService {
 		return this.monitoringConfig.coingeckoBaseUrl || undefined;
 	}
 
+	get geckoTerminalBaseUrl(): string | undefined {
+		return this.monitoringConfig.geckoTerminalBaseUrl || undefined;
+	}
+
 	get environment(): string | undefined {
 		return this.monitoringConfig.environment;
 	}
