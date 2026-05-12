@@ -1,0 +1,4 @@
+{
+	"_comment": "Whitelist of approved generic minters (lowercase addresses). Empty = deny any new minter proposal. Bridges are never auto-denied (different type). Update via PR and redeploy.",
+	"minters": []
+}
