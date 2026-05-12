@@ -88,6 +88,10 @@ export class AppConfigService {
 		return this.monitoringConfig.coingeckoApiKey || undefined;
 	}
 
+	get coingeckoBaseUrl(): string | undefined {
+		return this.monitoringConfig.coingeckoBaseUrl || undefined;
+	}
+
 	get environment(): string | undefined {
 		return this.monitoringConfig.environment;
 	}

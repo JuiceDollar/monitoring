@@ -88,15 +88,18 @@ export class ChallengeRepository {
 				challenger_address: string;
 				position_address: string;
 				start_timestamp: bigint;
-				size: any;
-				current_price: any;
+				size: string;
+				current_price: string;
 				t24_alerted: boolean;
 				t2_alerted: boolean;
 				challenge_period: bigint | null;
 			}>
 		>`
 			SELECT c.challenge_id, c.hub_address, c.challenger_address, c.position_address,
-			       c.start_timestamp, c.size, c.current_price, c.t24_alerted, c.t2_alerted,
+			       c.start_timestamp,
+			       c.size::text         as size,
+			       c.current_price::text as current_price,
+			       c.t24_alerted, c.t2_alerted,
 			       p.challenge_period
 			FROM challenge_states c
 			LEFT JOIN position_states p ON p.address = c.position_address
@@ -127,8 +130,8 @@ export class ChallengeRepository {
 				challengerAddress: r.challenger_address,
 				positionAddress: r.position_address,
 				startTimestamp: BigInt(r.start_timestamp),
-				size: BigInt(r.size.toString()),
-				currentPrice: BigInt(r.current_price.toString()),
+				size: BigInt(r.size),
+				currentPrice: BigInt(r.current_price),
 				t24Alerted: r.t24_alerted,
 				t2Alerted: r.t2_alerted,
 				challengePeriod: BigInt(r.challenge_period),
