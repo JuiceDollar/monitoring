@@ -29,17 +29,8 @@ interface CoingeckoEndpoint {
 	headers: Record<string, string>;
 }
 
-interface CoingeckoKeyInfo {
-	plan?: string;
-	monthly_call_credit?: number;
-	current_total_monthly_calls?: number;
-	current_remaining_monthly_calls?: number;
-}
-
 const STALENESS_ALERT_THRESHOLD_MS = 60 * 60 * 1000;
 const STALENESS_ALERT_REPEAT_MS = 6 * 60 * 60 * 1000;
-const QUOTA_REMAINING_ALERT_THRESHOLD = 25_000;
-const QUOTA_ALERT_REPEAT_MS = 24 * 60 * 60 * 1000;
 
 @Injectable()
 export class PriceService {
@@ -53,7 +44,6 @@ export class PriceService {
 	// the alert indefinitely.
 	private btcLastSuccessMs: number = Date.now();
 	private btcStalenessAlertedAt: number | null = null;
-	private quotaAlertedAt: number | null = null;
 
 	constructor(
 		private readonly providerService: ProviderService,
@@ -184,41 +174,6 @@ export class PriceService {
 			`BTC spot has not refreshed for ${minutes} min — suspicious-liq-price trigger ` +
 				`for WCBTC positions is running on stale or missing reference.`
 		);
-	}
-
-	/**
-	 * Daily probe of /api/v3/key through the pricing proxy. Emits a critical
-	 * alert when the monthly remaining call credit drops below
-	 * QUOTA_REMAINING_ALERT_THRESHOLD.
-	 */
-	@Cron(CronExpression.EVERY_DAY_AT_NOON)
-	async checkCoingeckoQuota(): Promise<void> {
-		try {
-			const { baseUrl, headers } = this.resolveCoingeckoEndpoint();
-			const response = await axios.get<CoingeckoKeyInfo>(`${baseUrl}/api/v3/key`, {
-				headers,
-				timeout: 10000,
-			});
-			const { current_remaining_monthly_calls: remaining, monthly_call_credit: credit } = response.data;
-			if (typeof remaining !== 'number' || typeof credit !== 'number' || credit <= 0) return;
-
-			const pct = Math.round((remaining / credit) * 100);
-			this.logger.log(`CoinGecko quota: ${remaining} of ${credit} calls remaining (${pct}%)`);
-
-			if (remaining >= QUOTA_REMAINING_ALERT_THRESHOLD) {
-				this.quotaAlertedAt = null;
-				return;
-			}
-			if (this.quotaAlertedAt && Date.now() - this.quotaAlertedAt < QUOTA_ALERT_REPEAT_MS) return;
-
-			this.quotaAlertedAt = Date.now();
-			await this.telegramService.sendCriticalAlert(
-				`CoinGecko monthly quota almost exhausted: ${remaining.toLocaleString()} of ` +
-					`${credit.toLocaleString()} calls remaining (${pct}%).`
-			);
-		} catch (error) {
-			this.logger.warn(`CoinGecko quota probe failed: ${error.message ?? error}`);
-		}
 	}
 
 	private async getGeckoTerminalPricesInUSD(addresses: string[]): Promise<{ [key: string]: string }> {
