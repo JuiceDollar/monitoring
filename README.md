@@ -91,8 +91,8 @@ Swagger documentation available at: `http://localhost:3001/swagger`
 ## CoinGecko
 
 The monitoring service needs a CoinGecko-compatible endpoint for BTC spot
-prices (drives the WCBTC suspicious-liq-price watchdog) and the daily Pro
-quota probe. Configuration is two env vars:
+prices — they drive the WCBTC suspicious-liq-price watchdog. Configuration
+is two env vars:
 
 | Var | Required | Purpose |
 |---|---|---|
