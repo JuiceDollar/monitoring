@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MonitoringConfig } from './monitoring.config';
 
-const SENSITIVE_KEYS = new Set<string>(['rpcUrl', 'databaseUrl', 'telegramBotToken', 'coingeckoApiKey']);
+const SENSITIVE_KEYS = new Set<string>(['rpcUrl', 'databaseUrl', 'telegramBotToken', 'coingeckoApiKey', 'guardPrivateKey']);
 
 function redactConfig<T>(config: T): T {
 	return walkRedact(config, '') as T;
@@ -102,5 +102,21 @@ export class AppConfigService {
 
 	get chain(): string | undefined {
 		return this.monitoringConfig.chain;
+	}
+
+	get guardEnabled(): boolean {
+		return this.monitoringConfig.guardEnabled || false;
+	}
+
+	get guardPrivateKey(): string | undefined {
+		return this.monitoringConfig.guardPrivateKey;
+	}
+
+	get guardHelperAddress(): string | undefined {
+		return this.monitoringConfig.guardHelperAddress;
+	}
+
+	get guardWhitelistFile(): string | undefined {
+		return this.monitoringConfig.guardWhitelistFile;
 	}
 }
