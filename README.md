@@ -17,6 +17,7 @@ The monitoring service continuously syncs blockchain data to provide real-time i
    - Collateral aggregation by token type
 4. **Token Prices**: Fetches real-time prices from GeckoTerminal API with caching
 5. **API Endpoints**: Serves data via REST API for frontend consumption
+6. **Minter Guard**: Optional auto-deny watcher (opt-in via `GUARD_ENABLED=true`). At the end of every monitoring cycle it submits `denyMinter()` for any `PROPOSED` minter not on a committed whitelist (`src/monitoringV2/config/whitelist.{testnet,mainnet}.json`). Requires `GUARD_PRIVATE_KEY` and `GUARD_HELPER_ADDRESS`. See `.env.example`.
 
 ## Tech Stack
 
