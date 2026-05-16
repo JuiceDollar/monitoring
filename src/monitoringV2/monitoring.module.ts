@@ -18,6 +18,7 @@ import { PositionService } from './position.service';
 import { ChallengeService } from './challenge.service';
 import { CollateralService } from './collateral.service';
 import { MinterService } from './minter.service';
+import { MinterGuardService } from './minter-guard.service';
 import { JusdService } from './jusd.service';
 import { MonitoringService } from './monitoring.service';
 import { PriceService } from './price.service';
@@ -47,6 +48,7 @@ import { ApiModule } from './api/api.module';
 		ChallengeService,
 		CollateralService,
 		MinterService,
+		MinterGuardService,
 		JusdService,
 		TelegramService,
 		MonitoringService,

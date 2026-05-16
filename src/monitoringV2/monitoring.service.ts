@@ -10,6 +10,7 @@ import { PositionService } from './position.service';
 import { ChallengeService } from './challenge.service';
 import { CollateralService } from './collateral.service';
 import { MinterService } from './minter.service';
+import { MinterGuardService } from './minter-guard.service';
 import { JusdService } from './jusd.service';
 import { TelegramService } from './telegram.service';
 
@@ -31,6 +32,7 @@ export class MonitoringService implements OnModuleInit {
 		private readonly challengeService: ChallengeService,
 		private readonly collateralService: CollateralService,
 		private readonly minterService: MinterService,
+		private readonly minterGuardService: MinterGuardService,
 		private readonly jusdService: JusdService,
 		private readonly telegramService: TelegramService
 	) {}
@@ -42,6 +44,7 @@ export class MonitoringService implements OnModuleInit {
 		await this.positionService.initialize();
 		await this.challengeService.initialize();
 		await this.minterService.initialize();
+		await this.minterGuardService.initialize();
 		await this.jusdService.initialize();
 		setTimeout(() => this.runMonitoring(), 5000);
 	}
@@ -135,6 +138,8 @@ export class MonitoringService implements OnModuleInit {
 		await this.collateralService.syncCollaterals(); // sync collateral states
 		await this.minterService.syncMinters(); // sync minter states
 		await this.jusdService.syncState(); // sync JUSD global state
+		// Auto-deny watcher: runs after minters have been synced so PROPOSED state is fresh.
+		await this.runWatcher('minterGuard', () => this.minterGuardService.checkAndDeny());
 		// Watchers wrapped individually so a bug in one cannot mask the alerts of the others.
 		// A throwing watcher is logged and the cycle continues; the outer try/catch is reserved
 		// for genuine sync-pipeline failures that need the consecutive-failures escalation.

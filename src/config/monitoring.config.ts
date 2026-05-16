@@ -86,6 +86,22 @@ export class MonitoringConfig {
 	@IsOptional()
 	@IsString()
 	chain?: string;
+
+	@IsOptional()
+	@IsBoolean()
+	guardEnabled?: boolean;
+
+	@IsOptional()
+	@IsString()
+	guardPrivateKey?: string;
+
+	@IsOptional()
+	@IsString()
+	guardHelperAddress?: string;
+
+	@IsOptional()
+	@IsString()
+	guardWhitelistFile?: string;
 }
 
 export default registerAs('monitoring', () => {
@@ -112,6 +128,11 @@ export default registerAs('monitoring', () => {
 	config.geckoTerminalBaseUrl = process.env.GECKOTERMINAL_BASE_URL || '';
 	config.environment = process.env.ENVIRONMENT?.toLowerCase();
 	config.chain = process.env.CHAIN;
+
+	config.guardEnabled = (process.env.GUARD_ENABLED || 'false').toLowerCase() === 'true';
+	config.guardPrivateKey = process.env.GUARD_PRIVATE_KEY || '';
+	config.guardHelperAddress = process.env.GUARD_HELPER_ADDRESS || '';
+	config.guardWhitelistFile = process.env.GUARD_WHITELIST_FILE || '';
 
 	const errors = validateSync(plainToClass(MonitoringConfig, config));
 	if (errors.length > 0) throw new Error(`Config validation failed: ${errors}`);
