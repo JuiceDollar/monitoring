@@ -34,8 +34,13 @@ if [ "${VAULT_FETCH_GUARD_KEY:-false}" = "true" ]; then
 	cp -r "$VAULT_BW_DATA_DIR"/* "$BW_RUNTIME_DIR"/ 2>/dev/null || true
 	export BITWARDENCLI_APPDATA_DIR="$BW_RUNTIME_DIR"
 
-	echo "entrypoint: configuring bw server $VAULT_SERVER_URL"
-	bw config server "$VAULT_SERVER_URL" > /dev/null
+	# bw refuses `config server` while logged in, so we never call it: the host's copied
+	# data is already logged into the right server. Verify the URL matches before we proceed.
+	CURRENT_SERVER="$(bw config server 2>/dev/null | tr -d '\n' || true)"
+	if [ -n "$CURRENT_SERVER" ] && [ "$CURRENT_SERVER" != "$VAULT_SERVER_URL" ]; then
+		echo "entrypoint: bw data dir is logged into '$CURRENT_SERVER' but VAULT_SERVER_URL='$VAULT_SERVER_URL'" >&2
+		exit 1
+	fi
 
 	echo "entrypoint: unlocking vault"
 	BW_PASSWORD="$(cat "$VAULT_PASSWORD_FILE")"
