@@ -1,4 +1,4 @@
 {
-	"_comment": "Whitelist of approved generic minters (lowercase addresses). Empty = deny any new minter proposal. Bridges are never auto-denied (different type). Update via PR and redeploy.",
+	"_comment": "Whitelist of approved minter addresses (lowercase). Empty = deny any new minter proposal, including bridges (bridge type is inferred from a trivial usd() view call and is therefore unsafe to exempt). Add legitimate proposals here via PR + redeploy before they pass the application period.",
 	"minters": []
 }
