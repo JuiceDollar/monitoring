@@ -91,7 +91,6 @@ export class PriceService {
 		if (remaining.length === 0) return cached;
 
 		const btcPrice = await this.getBtcPriceInUsd();
-		if (!btcPrice) return cached;
 
 		const prices: { [key: string]: string } = {};
 		for (const addr of remaining) {
@@ -129,30 +128,30 @@ export class PriceService {
 		return { baseUrl, headers };
 	}
 
-	private async getBtcPriceInUsd(): Promise<string | null> {
+	private async getBtcPriceInUsd(): Promise<string> {
 		const cached = this.priceCache.get('btc-usd');
 		if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
 			return cached.value;
 		}
 
-		try {
-			const { baseUrl, headers } = this.resolveCoingeckoEndpoint();
-			const response = await axios.get(`${baseUrl}/api/v3/simple/price?ids=bitcoin&vs_currencies=usd`, {
-				headers,
-				timeout: 10000,
-			});
+		const { baseUrl, headers } = this.resolveCoingeckoEndpoint();
+		const response = await axios.get(`${baseUrl}/api/v3/simple/price?ids=bitcoin&vs_currencies=usd`, {
+			headers,
+			timeout: 10000,
+		});
 
-			const price = String(response.data.bitcoin.usd);
-			const now = Date.now();
-			this.priceCache.set('btc-usd', { value: price, timestamp: now });
-			this.btcLastSuccessMs = now;
-			this.btcStalenessAlertedAt = null;
-			this.logger.log(`BTC price: $${price}`);
-			return price;
-		} catch (error) {
-			this.logger.error(`Failed to fetch BTC price: ${error.message}`);
-			return cached?.value ?? null;
+		const priceNum = Number(response.data?.bitcoin?.usd);
+		if (!Number.isFinite(priceNum) || priceNum <= 0) {
+			throw new Error(`CoinGecko returned invalid BTC price: bitcoin.usd=${response.data?.bitcoin?.usd}`);
 		}
+
+		const price = String(priceNum);
+		const now = Date.now();
+		this.priceCache.set('btc-usd', { value: price, timestamp: now });
+		this.btcLastSuccessMs = now;
+		this.btcStalenessAlertedAt = null;
+		this.logger.log(`BTC price: $${price}`);
+		return price;
 	}
 
 	/**
@@ -185,31 +184,26 @@ export class PriceService {
 
 		const baseUrl = this.appConfigService.geckoTerminalBaseUrl;
 
-		try {
-			const response = await axios.get<TokenPrice>(
-				`${baseUrl}/api/v2/simple/networks/citrea/token_price/${remaining.map((a) => a.toLowerCase()).join(',')}`,
-				{
-					headers: { accept: 'application/json' },
-					timeout: 10000,
-				}
-			);
-
-			const apiPrices = response.data.data.attributes.token_prices;
-			const normalizedPrices: { [key: string]: string } = {};
-			for (const inputAddress of remaining) {
-				const price = apiPrices[inputAddress.toLowerCase()];
-				if (price) {
-					normalizedPrices[inputAddress] = price;
-					this.setCache(inputAddress, price);
-				}
+		const response = await axios.get<TokenPrice>(
+			`${baseUrl}/api/v2/simple/networks/citrea/token_price/${remaining.map((a) => a.toLowerCase()).join(',')}`,
+			{
+				headers: { accept: 'application/json' },
+				timeout: 10000,
 			}
+		);
 
-			this.logger.log(`Fetched prices for ${Object.keys(normalizedPrices).length} tokens from GeckoTerminal`);
-			return { ...cached, ...normalizedPrices };
-		} catch (error) {
-			this.logger.error('Failed to fetch token prices from GeckoTerminal:', error.message);
-			return cached;
+		const apiPrices = response.data.data.attributes.token_prices;
+		const normalizedPrices: { [key: string]: string } = {};
+		for (const inputAddress of remaining) {
+			const price = apiPrices[inputAddress.toLowerCase()];
+			if (price) {
+				normalizedPrices[inputAddress] = price;
+				this.setCache(inputAddress, price);
+			}
 		}
+
+		this.logger.log(`Fetched prices for ${Object.keys(normalizedPrices).length} tokens from GeckoTerminal`);
+		return { ...cached, ...normalizedPrices };
 	}
 
 	private async getEquityPrice(requestedAddresses: string[]): Promise<{ [key: string]: string }> {
@@ -219,24 +213,20 @@ export class PriceService {
 		const remaining = requestedAddresses.filter((addr) => !cached[addr]);
 		if (remaining.length === 0) return cached;
 
+		const equityContract = new ethers.Contract(
+			ADDRESS[this.appConfigService.blockchainId].equity,
+			EquityABI,
+			this.providerService.provider
+		);
+		const nativePrice = await equityContract.price();
+		const formattedPrice = ethers.formatUnits(nativePrice, 18);
+
 		const prices: { [key: string]: string } = {};
 		for (const requestedAddress of remaining) {
-			try {
-				const equityContract = new ethers.Contract(
-					ADDRESS[this.appConfigService.blockchainId].equity,
-					EquityABI,
-					this.providerService.provider
-				);
-				const nativePrice = await equityContract.price();
-				const formattedPrice = ethers.formatUnits(nativePrice, 18);
-
-				prices[requestedAddress] = formattedPrice;
-				this.setCache(requestedAddress, formattedPrice);
-				this.logger.debug(`Fetched equity price: ${formattedPrice}`);
-			} catch (error) {
-				this.logger.error(`Failed to fetch equity price: ${error.message}`);
-			}
+			prices[requestedAddress] = formattedPrice;
+			this.setCache(requestedAddress, formattedPrice);
 		}
+		this.logger.debug(`Fetched equity price: ${formattedPrice}`);
 
 		return { ...cached, ...prices };
 	}
