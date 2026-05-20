@@ -30,6 +30,28 @@ export class ContractRepository {
 		}
 	}
 
+	// Core contracts are the canonical, hard-coded protocol addresses from
+	// @juicedollar/jusd. Their `type` is authoritative and must override any
+	// earlier classification (e.g. a contract first persisted as generic
+	// MINTER via MinterApplied and later promoted to a known type when the
+	// package shipped its address). Use upsert so re-registration corrects
+	// the type instead of being silently skipped.
+	async upsertCore(contracts: Contract[]): Promise<void> {
+		if (contracts.length === 0) return;
+
+		for (const contract of contracts) {
+			const address = contract.address.toLowerCase();
+			const metadata = contract.metadata || {};
+			await this.prisma.contract.upsert({
+				where: { address },
+				create: { address, type: contract.type, timestamp: contract.timestamp, metadata },
+				update: { type: contract.type, metadata },
+			});
+		}
+
+		this.logger.log(`Upserted ${contracts.length} core contracts`);
+	}
+
 	async findAll(): Promise<Contract[]> {
 		try {
 			const contracts = await this.prisma.contract.findMany({

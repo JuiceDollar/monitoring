@@ -74,7 +74,7 @@ export class ContractService {
 			},
 		];
 
-		await this.contractRepo.createMany(coreContracts);
+		await this.contractRepo.upsertCore(coreContracts);
 		this.logger.log(`Registry initialized with ${coreContracts.length} core contracts`);
 		this.logger.log(`Registered addresses: ${coreContracts.map((c) => c.address).join(', ')}`);
 	}
