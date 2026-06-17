@@ -71,7 +71,7 @@ export class EventService {
 			throw new Error(`Max recursion depth exceeded fetching blocks ${fromBlock}-${toBlock}`);
 		}
 
-		const logs = await this.providerService.provider.getLogs({
+		const logs = await this.providerService.getLogs({
 			address: addresses,
 			fromBlock,
 			toBlock,

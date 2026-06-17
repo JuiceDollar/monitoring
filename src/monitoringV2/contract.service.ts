@@ -168,7 +168,7 @@ export class ContractService {
 	private async isStablecoinBridge(address: string): Promise<boolean> {
 		try {
 			const contract = new ethers.Contract(address, StablecoinBridgeABI, this.providerService.provider);
-			await contract.usd(); // Fails if not a StablecoinBridge
+			await this.providerService.call(() => contract.usd()); // Reverts (deterministic) if not a StablecoinBridge
 			return true;
 		} catch {
 			return false;
