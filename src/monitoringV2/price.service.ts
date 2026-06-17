@@ -227,7 +227,7 @@ export class PriceService {
 					EquityABI,
 					this.providerService.provider
 				);
-				const nativePrice = await equityContract.price();
+				const nativePrice = await this.providerService.call(() => equityContract.price());
 				const formattedPrice = ethers.formatUnits(nativePrice, 18);
 
 				prices[requestedAddress] = formattedPrice;
