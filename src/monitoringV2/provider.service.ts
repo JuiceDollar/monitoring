@@ -195,10 +195,19 @@ export class ProviderService {
 
 	// Helper functions for retry logic
 
+	// Single source of truth for the error fields both classifiers read — ethers v6 exposes the
+	// HTTP status under different keys depending on the path (`status`, `info.responseStatus`,
+	// `response.status`), so probe all three to avoid divergence between the two checks.
+	private parseError(err: any): { status: number; code: string; msg: string } {
+		return {
+			status: Number(err?.status ?? err?.info?.responseStatus ?? err?.response?.status ?? NaN),
+			code: String(err?.code ?? err?.cause?.code ?? ''),
+			msg: String(err?.shortMessage ?? err?.message ?? '').toLowerCase(),
+		};
+	}
+
 	private isTransientRpcError(err: any): boolean {
-		const status = Number(err?.status ?? err?.response?.status ?? NaN);
-		const code = String(err?.code ?? err?.cause?.code ?? '');
-		const msg = String(err?.shortMessage ?? err?.message ?? '').toLowerCase();
+		const { status, code, msg } = this.parseError(err);
 
 		const matches = (patterns: string[]) => patterns.some((p) => msg.includes(p));
 
@@ -218,9 +227,7 @@ export class ProviderService {
 	 * would only churn connections, so they are retried without a recycle.
 	 */
 	private isConnectionError(err: any): boolean {
-		const status = Number(err?.status ?? err?.info?.responseStatus ?? NaN);
-		const code = String(err?.code ?? err?.cause?.code ?? '');
-		const msg = String(err?.shortMessage ?? err?.message ?? '').toLowerCase();
+		const { status, code, msg } = this.parseError(err);
 
 		// Exclude remote-side transient errors (HTTP 429 / 5xx) first: recreating the client
 		// changes nothing on the server and only churns connections. ethers v6 surfaces these
