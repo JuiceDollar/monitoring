@@ -23,8 +23,9 @@ export class MinterGuardService {
 	private readonly logger = new Logger(MinterGuardService.name);
 
 	private enabled = false;
-	private wallet?: ethers.Wallet;
-	private juiceDollar?: ethers.Contract;
+	private signerKey?: string;
+	private signerAddress?: string;
+	private jusdAddress?: string;
 	private whitelist = new Set<string>();
 	private helperAddress?: string;
 	private alreadyDenied = new Set<string>();
@@ -50,18 +51,22 @@ export class MinterGuardService {
 		if (!helper) throw new Error('GUARD_ENABLED=true but GUARD_HELPER_ADDRESS is missing');
 		if (!whitelistFile) throw new Error('GUARD_ENABLED=true but GUARD_WHITELIST_FILE is missing');
 
-		this.wallet = new ethers.Wallet(pk, this.providerService.provider);
-		this.helperAddress = ethers.getAddress(helper);
-
 		const jusdAddress = ADDRESS[this.config.blockchainId]?.juiceDollar;
 		if (!jusdAddress) throw new Error(`No JUSD address configured for chain ${this.config.blockchainId}`);
-		this.juiceDollar = new ethers.Contract(jusdAddress, JuiceDollarABI, this.wallet);
+
+		// Store the key/addresses, not a cached signer: the wallet + contract are rebuilt fresh per
+		// denyMinter from the live provider, so a provider recycle (ProviderService) can't leave the
+		// guard bound to a wedged connection. `new ethers.Wallet(pk)` also validates the key here.
+		this.signerKey = pk;
+		this.signerAddress = new ethers.Wallet(pk).address;
+		this.jusdAddress = jusdAddress;
+		this.helperAddress = ethers.getAddress(helper);
 
 		this.loadWhitelist(whitelistFile);
 		this.enabled = true;
 
 		this.logger.log(
-			`MinterGuard ENABLED: signer=${this.wallet.address}, helper=${this.helperAddress}, ` +
+			`MinterGuard ENABLED: signer=${this.signerAddress}, helper=${this.helperAddress}, ` +
 				`whitelist=${this.whitelist.size} entries, jusd=${jusdAddress}`
 		);
 	}
@@ -83,7 +88,8 @@ export class MinterGuardService {
 	 * and denies any not on the whitelist that haven't been denied yet.
 	 */
 	async checkAndDeny(): Promise<void> {
-		if (!this.enabled || !this.juiceDollar || !this.wallet || !this.helperAddress) return;
+		const { signerKey, jusdAddress, helperAddress } = this;
+		if (!this.enabled || !signerKey || !jusdAddress || !helperAddress) return;
 
 		const minters = await this.minterRepo.findAll();
 		// Denies BRIDGE-typed proposals too: bridge type is inferred from a single
@@ -100,11 +106,16 @@ export class MinterGuardService {
 
 		this.logger.warn(`Found ${candidates.length} unwhitelisted PROPOSED minter(s) to deny`);
 
+		// Build the signer + contract fresh from the live provider for this run, so a recycled
+		// provider is picked up rather than a stale connection captured at initialize().
+		const wallet = new ethers.Wallet(signerKey, this.providerService.provider);
+		const juiceDollar = new ethers.Contract(jusdAddress, JuiceDollarABI, wallet);
+
 		for (const minter of candidates) {
 			const address = ethers.getAddress(minter.address);
 			try {
 				const message = `Auto-deny by minter-guard: not in whitelist (${this.config.environment ?? 'unknown'}/${this.config.chain ?? 'unknown'})`;
-				const tx = await this.juiceDollar.denyMinter(address, [this.helperAddress], message);
+				const tx = await juiceDollar.denyMinter(address, [helperAddress], message);
 				this.logger.warn(`Submitted denyMinter for ${address}: tx=${tx.hash}`);
 				const receipt = await tx.wait();
 				this.alreadyDenied.add(address.toLowerCase());
