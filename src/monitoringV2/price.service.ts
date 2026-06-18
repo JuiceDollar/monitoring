@@ -222,12 +222,14 @@ export class PriceService {
 		const prices: { [key: string]: string } = {};
 		for (const requestedAddress of remaining) {
 			try {
-				const equityContract = new ethers.Contract(
-					ADDRESS[this.appConfigService.blockchainId].equity,
-					EquityABI,
-					this.providerService.provider
+				// Contract built inside the thunk so a mid-call provider recycle is picked up on the retry.
+				const nativePrice = await this.providerService.call(() =>
+					new ethers.Contract(
+						ADDRESS[this.appConfigService.blockchainId].equity,
+						EquityABI,
+						this.providerService.provider
+					).price()
 				);
-				const nativePrice = await this.providerService.call(() => equityContract.price());
 				const formattedPrice = ethers.formatUnits(nativePrice, 18);
 
 				prices[requestedAddress] = formattedPrice;
