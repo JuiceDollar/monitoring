@@ -167,8 +167,8 @@ export class ContractService {
 
 	private async isStablecoinBridge(address: string): Promise<boolean> {
 		try {
-			const contract = new ethers.Contract(address, StablecoinBridgeABI, this.providerService.provider);
-			await contract.usd(); // Fails if not a StablecoinBridge
+			// Contract built inside the thunk so a mid-call provider recycle is picked up on the retry.
+			await this.providerService.call(() => new ethers.Contract(address, StablecoinBridgeABI, this.providerService.provider).usd()); // Reverts (deterministic) if not a StablecoinBridge
 			return true;
 		} catch {
 			return false;

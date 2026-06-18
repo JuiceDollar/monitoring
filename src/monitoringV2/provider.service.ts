@@ -73,6 +73,10 @@ export class ProviderService {
 		'SERVER_ERROR',
 		'TIMEOUT',
 	]);
+	// OS-level socket failures only — deliberately excludes the ethers meta-codes
+	// 'SERVER_ERROR'/'NETWORK_ERROR', which ethers also emits for HTTP 429/5xx. Those are
+	// remote-side and must NOT trigger a client-side provider recycle (see isConnectionError).
+	private static readonly CONNECTION_CODES = new Set(['ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED', 'ECONNREFUSED', 'EAI_AGAIN']);
 	private static readonly TOO_LARGE_PATTERNS = [
 		'payload too large',
 		'request entity too large',
@@ -116,6 +120,24 @@ export class ProviderService {
 		this.logger.log(`Provider initialized (no Multicall3 on Citrea, using sequential calls)`);
 	}
 
+	/**
+	 * Rebuilds the ethers provider from scratch (on Citrea there is no Multicall3, so
+	 * `multicallProviderInstance` is the same JsonRpcProvider and is rebuilt with it).
+	 *
+	 * The provider is a long-lived singleton. A connection-level failure ("socket hang up",
+	 * ECONNRESET, …) can leave the underlying HTTP/TLS state wedged, and because the sync
+	 * services bind their contracts to `multicallProvider`, every subsequent cycle keeps
+	 * reusing the same poisoned instance — withRetry alone never escapes it (it re-runs the
+	 * same thunks against the same provider). Recycling swaps the singleton so the next call,
+	 * and the next cycle's freshly built contracts, start on a clean connection. The block
+	 * cache is dropped because its entries were fetched through the discarded provider.
+	 */
+	private recycleProvider() {
+		this.logger.warn('Recycling RPC provider after connection-level failure');
+		this.blockCache.clear();
+		this.initializeProvider();
+	}
+
 	get provider(): ethers.JsonRpcProvider {
 		return this.ethersProvider;
 	}
@@ -140,6 +162,10 @@ export class ProviderService {
 		return results;
 	}
 
+	async call<T>(thunk: () => Promise<T>, retries = 5): Promise<T> {
+		return this.withRetry(thunk, { retries });
+	}
+
 	async getBlock(blockNumber: number): Promise<ethers.Block | null> {
 		if (this.blockCache.has(blockNumber)) {
 			return this.blockCache.get(blockNumber);
@@ -160,16 +186,30 @@ export class ProviderService {
 		return await this.withRetry(() => this.ethersProvider.getBlockNumber());
 	}
 
+	async getLogs(filter: ethers.Filter | ethers.FilterByBlockHash): Promise<ethers.Log[]> {
+		return await this.withRetry(() => this.ethersProvider.getLogs(filter));
+	}
+
 	getRpcStats(): Record<string, { calls: number; errors: number }> {
 		return this.rpcStats.getStats();
 	}
 
 	// Helper functions for retry logic
 
+	// Single source of truth for the error fields both classifiers read. ethers v6 attaches the
+	// failing HTTP response to `err.response` (a FetchResponse whose status is `.statusCode`, see
+	// fetch.js assertOk); other error shapes use `err.status`/`err.statusCode`/`err.response.status`.
+	// Probe them all so the status-based checks are not silently dead for ethers' own errors.
+	private parseError(err: any): { status: number; code: string; msg: string } {
+		return {
+			status: Number(err?.status ?? err?.statusCode ?? err?.response?.statusCode ?? err?.response?.status ?? NaN),
+			code: String(err?.code ?? err?.cause?.code ?? ''),
+			msg: String(err?.shortMessage ?? err?.message ?? '').toLowerCase(),
+		};
+	}
+
 	private isTransientRpcError(err: any): boolean {
-		const status = Number(err?.status ?? err?.response?.status ?? NaN);
-		const code = String(err?.code ?? err?.cause?.code ?? '');
-		const msg = String(err?.shortMessage ?? err?.message ?? '').toLowerCase();
+		const { status, code, msg } = this.parseError(err);
 
 		const matches = (patterns: string[]) => patterns.some((p) => msg.includes(p));
 
@@ -182,6 +222,25 @@ export class ProviderService {
 		return ProviderService.NET_CODES.has(code) || matches(ProviderService.NETWORK_PATTERNS);
 	}
 
+	/**
+	 * A connection-level failure where recycling the provider can help — the socket/TLS
+	 * state is the suspect. Distinct from remote-side transient errors (HTTP 429/5xx):
+	 * those are the server's problem, recreating the client would not change anything and
+	 * would only churn connections, so they are retried without a recycle.
+	 */
+	private isConnectionError(err: any): boolean {
+		const { status, code, msg } = this.parseError(err);
+
+		// Exclude remote-side transient errors (HTTP 429 / 5xx) first: recreating the client
+		// changes nothing on the server and only churns connections. ethers v6 surfaces these
+		// with code 'SERVER_ERROR' and a "server response <status>" message.
+		if (status === 429 || ProviderService.SERVER_STATUSES.has(status)) return false;
+		if (ProviderService.RATE_LIMIT_PATTERNS.some((p) => msg.includes(p))) return false;
+		if (/server response \d{3}/.test(msg)) return false;
+
+		return ProviderService.CONNECTION_CODES.has(code) || ProviderService.NETWORK_PATTERNS.some((p) => msg.includes(p));
+	}
+
 	private async withRetry<T>(
 		fn: () => Promise<T>,
 		options: { retries?: number; baseMs?: number; factor?: number; maxMs?: number } = {}
@@ -189,6 +248,7 @@ export class ProviderService {
 		const { retries = 5, baseMs = 200, factor = 2, maxMs = 5000 } = options;
 		let attempt = 0;
 		let delay = baseMs;
+		let recycled = false;
 
 		while (true) {
 			try {
@@ -198,6 +258,15 @@ export class ProviderService {
 				if (attempt > retries || !this.isTransientRpcError(err)) {
 					this.logger.error(`RPC call failed after ${attempt} attempts: ${err.message}`);
 					throw err;
+				}
+
+				// On a connection-level failure, swap the provider once before retrying. Provider-direct
+				// calls (getLogs/getBlock/getBlockNumber) pick up the fresh connection on their remaining
+				// attempts; the sequential sync path recovers on the next cycle, which rebuilds its
+				// contracts against the new singleton. Once per withRetry call: a blip must not thrash it.
+				if (!recycled && this.isConnectionError(err)) {
+					this.recycleProvider();
+					recycled = true;
 				}
 
 				const jitter = Math.random() * 0.4 + 0.8; // 0.8x–1.2x
