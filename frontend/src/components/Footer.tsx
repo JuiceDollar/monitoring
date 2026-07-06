@@ -1,7 +1,7 @@
-import { DEPLOYMENT_ENV, resolveChain, TELEGRAM_BOT } from '../constants';
+import { DEPLOYMENT_ENV, TELEGRAM_BOT } from '../constants';
 
 export function Footer() {
-	const botUrl = TELEGRAM_BOT[resolveChain()][DEPLOYMENT_ENV];
+	const botUrl = TELEGRAM_BOT.mainnet[DEPLOYMENT_ENV];
 
 	return (
 		<footer className="border-t border-neutral-800 mt-8">
