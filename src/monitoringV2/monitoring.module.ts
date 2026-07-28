@@ -53,6 +53,6 @@ import { ApiModule } from './api/api.module';
 		TelegramService,
 		MonitoringService,
 	],
-	exports: [MonitoringService, ContractService, EventService, ApiModule],
+	exports: [MonitoringService, ContractService, EventService, MinterGuardService, ApiModule],
 })
 export class MonitoringV2Module {}

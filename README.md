@@ -17,7 +17,7 @@ The monitoring service continuously syncs blockchain data to provide real-time i
    - Collateral aggregation by token type
 4. **Token Prices**: Fetches real-time prices from GeckoTerminal API with caching
 5. **API Endpoints**: Serves data via REST API for frontend consumption
-6. **Minter Guard**: Optional auto-deny watcher (opt-in via `GUARD_ENABLED=true`). At the end of every monitoring cycle it submits `denyMinter()` for any `PROPOSED` minter not on a committed whitelist (`src/monitoringV2/config/whitelist.mainnet.json`). Requires `GUARD_PRIVATE_KEY` and `GUARD_HELPER_ADDRESS`. See `.env.example`.
+6. **Minter Guard**: Optional auto-deny watcher (opt-in via `GUARD_ENABLED=true`). At the end of every monitoring cycle it submits `denyMinter()` for any `PROPOSED` minter not on the committed whitelist (`src/monitoringV2/config/whitelist.mainnet.json`), bridges included. `denyMinter` is a shareholder veto (not an admin call): the signer needs ≥2% of Equity voting power (`Equity.checkQualified`), alone or via delegators, within the finite application window from `suggestMinter`. The guard verifies qualification and gas before sending (skips loudly and rate-limits those pages instead of submitting a doomed tx). Helpers are derived from indexed `Delegation` events; `GUARD_HELPER_ADDRESS` is an optional static seed for a named helper independent of the indexer. Permanently rejected denies (expired application period) stop retrying; other failures stop after a bounded attempt count with a single escalation. Live status is at `GET /guard` and rendered as the dashboard "Guard Delegation" section (where shareholders can delegate). An empty whitelist is deny-by-default and logged as a warning. See `.env.example`.
 
 ## Tech Stack
 
@@ -88,6 +88,7 @@ Swagger documentation available at: `http://localhost:3001/swagger`
 | `/collateral` | Supported collateral tokens |
 | `/jusd` | JUSD supply and protocol stats |
 | `/minters` | Registered minters |
+| `/guard` | Minter-guard live status |
 
 ## CoinGecko
 
