@@ -12,7 +12,7 @@ import { CollateralService } from './collateral.service';
 import { MinterService } from './minter.service';
 import { MinterGuardService, GuardConfigError } from './minter-guard.service';
 import { JusdService } from './jusd.service';
-import { TelegramService } from './telegram.service';
+import { TelegramService, escapeMarkdownText } from './telegram.service';
 
 @Injectable()
 export class MonitoringService implements OnModuleInit {
@@ -54,11 +54,18 @@ export class MonitoringService implements OnModuleInit {
 			if (error instanceof GuardConfigError) throw error;
 			const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
 			this.logger.error(`MinterGuard init failed — guard DISABLED, monitoring continues: ${errorMsg}`, error?.stack || error);
-			await this.telegramService.sendCriticalAlert(
+			// One-shot bootstrap path, not a per-cycle watcher: no retry machinery here (unlike the guard's
+			// own per-cycle pendingAlert retry) — this logger.error is the durable record if delivery fails.
+			const delivered = await this.telegramService.sendCriticalAlert(
 				`⚠️ *Minter guard init failed — guard DISABLED*\n\n` +
 					`The auto-deny guard is OFF for this run; monitoring continues.\n` +
-					`Error: ${errorMsg}`
+					`Error: ${escapeMarkdownText(errorMsg)}`
 			);
+			if (!delivered) {
+				this.logger.error(
+					`MinterGuard init-failure page could not be delivered — guard is OFF for this run with no notification sent`
+				);
+			}
 		}
 		await this.jusdService.initialize();
 		setTimeout(() => this.runMonitoring(), 5000);

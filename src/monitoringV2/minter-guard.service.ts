@@ -6,7 +6,7 @@ import { AppConfigService } from '../config/config.service';
 import { ProviderService } from './provider.service';
 import { MinterRepository } from './prisma/repositories/minter.repository';
 import { EventsRepository } from './prisma/repositories/events.repository';
-import { TelegramService } from './telegram.service';
+import { TelegramService, escapeMarkdownText } from './telegram.service';
 import { MinterStatus } from './types';
 import { computeHelpers, classifyDenyError, QUORUM_BPS } from './minter-guard.logic';
 import { GuardResponse } from '../../shared/types';
@@ -52,7 +52,24 @@ const MAX_DENY_ATTEMPTS = 3;
 // the time-critical deny work (each send sleeps 50ms per subscriber). Remainder waits for the next cycle.
 const MAX_ALERT_RETRIES_PER_CYCLE = 5;
 
-type SkipAlertKind = 'votes' | 'gas' | 'seed' | 'precheck' | 'deadline';
+// Cap serial minters() reads in the resolve pass so a large PROPOSED set cannot stretch one cycle past the
+// 5-minute cadence and delay every later watcher. Remainder is examined on a later cycle.
+const MAX_RESOLVE_READS_PER_CYCLE = 25;
+
+// Cap serial minters() reads in the passing-unchallenged sweep for the same cadence reason. Paired with
+// round-robin resume so a fixed start cannot starve the same tail forever under the cap.
+const MAX_SWEEP_READS_PER_CYCLE = 25;
+
+// Safe Telegram body length (Telegram rejects sendMessage bodies over 4096). Comfortably under the hard
+// limit so Markdown/entity overhead cannot push a page into permanent undeliverable rejection.
+const MAX_ALERT_BODY_CHARS = 3500;
+
+// Short backoff after a FAILED skip-page delivery. Full SKIP_ALERT_COOLDOWN_MS still applies on success
+// (and when alerts are disabled). Trade-off: a delivered page must not repeat for an hour; a failed one
+// must be retried; neither may become a per-cycle loop (twelve attempts an hour).
+const SKIP_ALERT_RETRY_BACKOFF_MS = 15 * 60 * 1000;
+
+type SkipAlertKind = 'votes' | 'gas' | 'seed' | 'precheck' | 'deadline' | 'invariant';
 
 interface DenyStateEntry {
 	attempts: number;
@@ -116,7 +133,12 @@ export class MinterGuardService {
 		seed: 0,
 		precheck: 0,
 		deadline: 0,
+		invariant: 0,
 	};
+	// Round-robin resume for the capped sweep: address last examined when the read cap stopped the pass.
+	// Next cycle starts AFTER this key so entries beyond MAX_SWEEP_READS_PER_CYCLE are not starved forever
+	// under a fixed Map iteration start.
+	private sweepResumeAfter?: string;
 	// Built once from JuiceDollar + Equity ABIs so both TooLate and NotQualified decode.
 	private denyErrorInterface?: ethers.Interface;
 
@@ -217,28 +239,33 @@ export class MinterGuardService {
 	}
 
 	/**
-	 * Startup preflight: obtain the same contract-truthful verdict as GET /guard via getStatus()
-	 * (votesDelegated + seed-less retry) so the dashboard and the boot log can never disagree. Pages once
-	 * if under the 2% quorum when helpers/seed are assessable. Deliberately does NOT abort bootstrap on
-	 * not-qualified: taking the whole monitoring process down over a governance state that delegation can
-	 * fix at runtime would be strictly worse than running loud-but-degraded. A getStatus transport failure
-	 * is warn-only (no page, no throw) so a transient blip at boot cannot page or kill.
+	 * Startup preflight: obtain the same contract-truthful qualification verdict as GET /guard via
+	 * evaluateQualification() (votesDelegated + seed-less retry) — deliberately NOT getStatus(), so a
+	 * gas-read failure (getBalance / getFeeData) cannot suppress the under-quorum page the probe exists
+	 * for. Dashboard and boot log still share the qualification half. Pages once if under the 2% quorum
+	 * when helpers/seed are assessable. Deliberately does NOT abort bootstrap on not-qualified: taking the
+	 * whole monitoring process down over a governance state that delegation can fix at runtime would be
+	 * strictly worse than running loud-but-degraded. A qualification transport failure is warn-only (no
+	 * page, no throw) so a transient blip at boot cannot page or kill.
 	 *
 	 * Empty delegation graph with no seed: cannot distinguish "not backfilled yet" from "genuinely nobody
 	 * delegates". Consequence is at most a missing convenience page at boot — the per-cycle pre-check pages
-	 * as soon as a real candidate exists. The signer's own votes are still assessed via getStatus().
+	 * as soon as a real candidate exists. The signer's own votes are still assessed via evaluateQualification().
 	 */
 	private async probeQualification(): Promise<void> {
 		const signerAddress = this.signerAddress;
 		if (!signerAddress) return;
 
+		const quorumPct = Number(QUORUM_BPS) / 100;
+
 		try {
-			const status = await this.getStatus();
+			// Qualification only — gas reads live in getStatus and must not gate this page.
+			const status = await this.evaluateQualification();
 
 			if (status.qualified) {
 				this.logger.log(
 					`MinterGuard startup: signer ${signerAddress} qualified at ${status.votingPowerPct}% ` +
-						`(quorum ${status.quorumPct}%) with ${status.helperCount} helper(s)`
+						`(quorum ${quorumPct}%) with ${status.helperCount} helper(s)`
 				);
 				return;
 			}
@@ -251,7 +278,7 @@ export class MinterGuardService {
 				// pages as soon as a real candidate exists (see method docstring).
 				this.logger.warn(
 					`MinterGuard startup: signer ${signerAddress} alone is below the 2% quorum ` +
-						`(${status.votingPowerPct}% < ${status.quorumPct}%); helpers cannot be assessed until the ` +
+						`(${status.votingPowerPct}% < ${quorumPct}%); helpers cannot be assessed until the ` +
 						`Delegation graph is backfilled. The per-cycle pre-check will page once a real candidate exists.`
 				);
 				return;
@@ -259,15 +286,15 @@ export class MinterGuardService {
 
 			this.logger.error(
 				`MinterGuard startup: signer ${signerAddress} under quorum ` +
-					`(${status.votingPowerPct}% < ${status.quorumPct}%). denyMinter will be skipped until qualified.`
+					`(${status.votingPowerPct}% < ${quorumPct}%). denyMinter will be skipped until qualified.`
 			);
-			await this.telegramService.sendCriticalAlert(
+			const startupMsg =
 				`⚠️ *Minter guard under 2% quorum at startup*\n\n` +
-					`Signer: \`${signerAddress}\`\n` +
-					`Voting power: ${this.escapeMarkdown(status.votingPowerPct)}% (needs >= ${status.quorumPct}%)\n` +
-					`Helpers: ${status.helperCount}\n\n` +
-					`Remedy: delegateVoteTo(${signerAddress}) on Equity, or fund the signer with JUICE.`
-			);
+				`Signer: \`${signerAddress}\`\n` +
+				`Voting power: ${escapeMarkdownText(status.votingPowerPct)}% (needs >= ${quorumPct}%)\n` +
+				`Helpers: ${status.helperCount}\n\n` +
+				`Remedy: delegateVoteTo(${signerAddress}) on Equity, or fund the signer with JUICE.`;
+			await this.telegramService.sendCriticalAlert(this.truncateAlertBody(startupMsg));
 		} catch (error) {
 			// Transient RPC blip at boot must not page and must not throw (see method docstring).
 			const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
@@ -298,14 +325,13 @@ export class MinterGuardService {
 	}
 
 	/**
-	 * Escape Telegram legacy-Markdown specials so dynamic provider/config text cannot poison
-	 * parse_mode: 'Markdown' delivery (Telegram rejects malformed entities, which would make those
-	 * error classes permanently undeliverable and retry the same unsendable text forever). Escapes
-	 * `_`, `*`, backtick and `[` by prefixing each with a backslash. Mirrors the established pattern
-	 * used for `[` in telegram.service.envTag().
+	 * Truncate a terminal page body to MAX_ALERT_BODY_CHARS so Telegram cannot permanently reject it
+	 * (hard limit 4096). A truncated body always ends with an explicit marker so operators know text was cut.
+	 * Applied before every store and every send — never retain an untruncated body as pendingAlert.
 	 */
-	private escapeMarkdown(value: string): string {
-		return value.replace(/([_*`\[])/g, '\\$1');
+	private truncateAlertBody(message: string): string {
+		if (message.length <= MAX_ALERT_BODY_CHARS) return message;
+		return `${message.slice(0, MAX_ALERT_BODY_CHARS)}\n\n… (truncated)`;
 	}
 
 	/**
@@ -313,24 +339,28 @@ export class MinterGuardService {
 	 * On confirmed delivery sets alerted=true and clears pendingAlert. On failure keeps pendingAlert
 	 * so the next cycle can retry — prevents "done + alerted with zero notification" when Telegram is down.
 	 * When alerts are disabled entirely there is nothing to retry: alerted=true without pendingAlert;
-	 * logger.error is the durable record (not swallowing).
+	 * logger.error is the durable record (not swallowing). Bodies are always truncated (see truncateAlertBody)
+	 * so a long provider error cannot make a page permanently undeliverable.
 	 */
 	private async deliverTerminalAlert(addrLc: string, state: DenyStateEntry, message: string): Promise<void> {
 		if (state.alerted) return;
 
+		const body = this.truncateAlertBody(message);
+
 		// Telegram disabled: nothing to deliver to and nothing to retry — error log is the record.
 		if (!this.telegramService.alertsEnabled) {
 			this.denyState.set(addrLc, { ...state, alerted: true, pendingAlert: undefined });
-			this.logger.error(`MinterGuard terminal page not deliverable (telegram disabled; not retained for retry): ${message}`);
+			this.logger.error(`MinterGuard terminal page not deliverable (telegram disabled; not retained for retry): ${body}`);
 			return;
 		}
 
-		const delivered = await this.telegramService.sendCriticalAlert(message);
+		const delivered = await this.telegramService.sendCriticalAlert(body);
 		if (delivered) {
 			this.denyState.set(addrLc, { ...state, alerted: true, pendingAlert: undefined });
 		} else {
-			this.denyState.set(addrLc, { ...state, alerted: false, pendingAlert: message });
-			this.logger.error(`MinterGuard terminal page could not be delivered; will retry next cycle for ${addrLc}: ${message}`);
+			// Store the truncated body only — retry must never re-send an oversize original.
+			this.denyState.set(addrLc, { ...state, alerted: false, pendingAlert: body });
+			this.logger.error(`MinterGuard terminal page could not be delivered; will retry next cycle for ${addrLc}: ${body}`);
 		}
 	}
 
@@ -340,6 +370,10 @@ export class MinterGuardService {
 	 * backlog from an outage cannot delay the time-critical deny work; remainder waits for the next
 	 * cycle (logged at warn so a truncated backlog is never mistaken for an empty one). Runs at the
 	 * END of checkAndDeny even when there are no candidates — notifications are not time-critical.
+	 *
+	 * On a failed retry the entry is delete+re-set so Map insertion order moves it to the end: the next
+	 * cycle starts with pages not tried recently. Without rotation, five permanently failing entries at
+	 * the front of the map would starve every later pending page indefinitely under the per-cycle cap.
 	 */
 	private async retryPendingAlerts(): Promise<void> {
 		const pending: Array<[string, DenyStateEntry]> = [];
@@ -359,9 +393,30 @@ export class MinterGuardService {
 				);
 				break;
 			}
-			// pendingAlert is defined by the filter above.
+			// pendingAlert is defined by the filter above; re-truncate in case an older entry predates the cap.
 			await this.deliverTerminalAlert(addrLc, state, state.pendingAlert as string);
 			attempted++;
+
+			// Rotate failed retries to the end of Map iteration order (starvation prevention — see method).
+			const after = this.denyState.get(addrLc);
+			if (after && after.pendingAlert && after.alerted !== true) {
+				this.denyState.delete(addrLc);
+				this.denyState.set(addrLc, after);
+			}
+		}
+
+		// Aggregate backlog line, independent of whether the cap truncated the pass: a page attempted this
+		// cycle that STILL failed (as opposed to never attempted) would otherwise leave no summary line at
+		// all when the pending count is at or below the cap — a backlog must never be invisible.
+		// Individual failures keep their own log line from deliverTerminalAlert.
+		let stillPendingAfter = 0;
+		for (const state of this.denyState.values()) {
+			if (state.pendingAlert && state.alerted !== true) stillPendingAfter++;
+		}
+		if (stillPendingAfter > 0) {
+			this.logger.warn(
+				`MinterGuard: ${stillPendingAfter} pending terminal page(s) still awaiting delivery after this cycle's retry pass`
+			);
 		}
 	}
 
@@ -396,17 +451,27 @@ export class MinterGuardService {
 		// Addresses still in this cycle's candidate set (handled by the deny path when actionable).
 		const candidateAddressSet = new Set(candidates.map((m) => m.address.toLowerCase()));
 
-		// Resolve pass BEFORE pre-check: read each on-chain deadline so (a) already-resolved minters do
-		// not inflate the under-quorum candidate count and (b) urgency order can replace database order.
+		// Resolve pass BEFORE pre-check: filter already-resolved minters, order by urgency, and give the
+		// pre-check an honest actionable candidate count. Deadlines read here are NOT authoritative for the
+		// send — the mapping can change while the cycle runs (another actor may deny mid-loop); the send
+		// loop re-reads minters(address) immediately before each deny (see send loop).
 		const workingSet: ResolvedCandidate[] = [];
 		if (candidates.length > 0) {
 			this.logger.warn(`Found ${candidates.length} unwhitelisted PROPOSED minter(s) to deny`);
 
+			let resolveReads = 0;
+			let resolveTruncated = false;
 			for (const minter of candidates) {
+				// Cap serial RPC so this pass cannot outgrow the 5-minute cadence (see MAX_RESOLVE_READS_PER_CYCLE).
+				if (resolveReads >= MAX_RESOLVE_READS_PER_CYCLE) {
+					resolveTruncated = true;
+					break;
+				}
 				const address = ethers.getAddress(minter.address);
 				const addrLc = address.toLowerCase();
 				let onChainDeadline: bigint;
 				try {
+					resolveReads++;
 					onChainDeadline = BigInt(await juiceDollar.minters(address));
 				} catch (error) {
 					// Sustained RPC fault must not let a veto window expire in silence — rate-limited page.
@@ -416,7 +481,7 @@ export class MinterGuardService {
 						'deadline',
 						`⚠️ *Minter guard could not read deny deadline*\n\n` +
 							`Address: \`${address}\`\n` +
-							`Detail: ${this.escapeMarkdown(errorMsg)}\n\n` +
+							`Detail: ${escapeMarkdownText(errorMsg)}\n\n` +
 							`The on-chain application deadline could not be read this cycle; the candidate is deferred ` +
 							`(not marked done). Investigate RPC if this persists — a silent window expiry must not happen.`
 					);
@@ -434,7 +499,23 @@ export class MinterGuardService {
 					);
 					continue;
 				}
+				// INVARIANT: every minter the guard has ever considered deniable (non-zero on-chain deadline)
+				// is tracked in denyState. The sweep iterates denyState only; without this entry a candidate
+				// that hits a continue path (confirmation-budget deferral, getBlock failure) or an ok:false
+				// pre-check that returns before the send loop would be invisible to the sweep — and once
+				// syncMinters flips the row to APPROVED the veto window can pass with no page at all.
+				// Do not touch an existing entry (attempts/done/pendingAlert must survive).
+				if (this.denyState.get(addrLc) === undefined) {
+					this.denyState.set(addrLc, { attempts: 0 });
+				}
 				workingSet.push({ address, onChainDeadline });
+			}
+			if (resolveTruncated) {
+				const notExamined = candidates.length - resolveReads;
+				this.logger.warn(
+					`MinterGuard: resolve pass capped at ${MAX_RESOLVE_READS_PER_CYCLE} minters() reads; ` +
+						`${notExamined} candidate(s) not examined this cycle (truncated — not a completed pass)`
+				);
 			}
 		}
 
@@ -454,29 +535,47 @@ export class MinterGuardService {
 				let confirmBudgetSpentMs = 0;
 				let deferDeniesLogged = false;
 
-				for (const { address, onChainDeadline } of workingSet) {
+				for (const { address, onChainDeadline: resolveDeadline } of workingSet) {
 					const addrLc = address.toLowerCase();
 
-					// Just-in-time TooLate guard. denyMinter reverts TooLate once block.timestamp >
-					// minters[_minter] (the on-chain validityStart set by suggestMinter). Deadline was already
-					// read in the resolve pass; re-read only the live block timestamp so the comparison advances
-					// during the cycle (which is what this check is for).
+					// Just-in-time TooLate / already-resolved guard. denyMinter reverts TooLate once
+					// block.timestamp > minters[_minter]. Re-read BOTH the live block timestamp and the
+					// on-chain deadline immediately before send: the resolve-pass deadline is stale once
+					// another actor denies mid-cycle (mapping deleted → 0) while we wait on a previous
+					// candidate's confirmation. Sending with a stale deadline reverts, marks the minter
+					// permanently failed, and pages "manual denyMinter() required" for a minter already denied.
+					// currentDeadline is the authoritative value for buffer comparison and windowClosed text.
 					let latestBlock: ethers.Block | null = null;
+					let currentDeadline: bigint;
 					try {
 						latestBlock = await this.providerService.provider.getBlock('latest');
+						currentDeadline = BigInt(await juiceDollar.minters(address));
 					} catch (error) {
 						const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
-						this.logger.error(`MinterGuard skip ${address}: failed to read latest block for TooLate pre-check: ${errorMsg}`);
+						this.logger.error(
+							`MinterGuard skip ${address}: failed to re-read latest block / minters for TooLate pre-check: ${errorMsg}`
+						);
 						continue;
 					}
 					if (!latestBlock) {
 						this.logger.error(`MinterGuard skip ${address}: provider.getBlock('latest') returned null for TooLate pre-check`);
 						continue;
 					}
-					if (BigInt(latestBlock.timestamp) + DENY_TOOLATE_BUFFER_SECONDS >= onChainDeadline) {
+					// Resolved by someone else mid-cycle: mapping entry gone — mark done, no alert (false-alarm class).
+					if (currentDeadline === 0n) {
+						const prev = this.denyState.get(addrLc) || { attempts: 0 };
+						this.denyState.set(addrLc, { ...prev, done: true });
+						this.logger.warn(
+							`MinterGuard skip ${address}: on-chain minters(address)=0 at send time ` +
+								`(resolved by another actor mid-cycle; resolve-pass deadline was ${resolveDeadline}) — ` +
+								`marking done without alert`
+						);
+						continue;
+					}
+					if (BigInt(latestBlock.timestamp) + DENY_TOOLATE_BUFFER_SECONDS >= currentDeadline) {
 						this.logger.warn(
 							`MinterGuard skip ${address}: deny window closed or about to close ` +
-								`(block ts ${latestBlock.timestamp} + ${DENY_TOOLATE_BUFFER_SECONDS}s buffer >= on-chain deadline ${onChainDeadline})`
+								`(block ts ${latestBlock.timestamp} + ${DENY_TOOLATE_BUFFER_SECONDS}s buffer >= on-chain deadline ${currentDeadline})`
 						);
 						const prev = this.denyState.get(addrLc) || { attempts: 0 };
 						const next: DenyStateEntry = { ...prev, done: true };
@@ -486,8 +585,9 @@ export class MinterGuardService {
 							const alertMsg =
 								`⚠️ *Unwhitelisted minter passing unchallenged*\n\n` +
 								`Address: \`${address}\`\n` +
-								`The application period has closed (or is within the ${DENY_TOOLATE_BUFFER_SECONDS}s buffer) — ` +
-								`denyMinter is impossible; the minter will pass unless it is a bridge that can be handled otherwise.`;
+								`The application period has closed or is within the ${DENY_TOOLATE_BUFFER_SECONDS}s ` +
+								`safety buffer — a deny will no longer be attempted; the minter will pass unless it ` +
+								`is a bridge that can be handled otherwise.`;
 							await this.deliverTerminalAlert(addrLc, next, alertMsg);
 						}
 						continue;
@@ -496,6 +596,7 @@ export class MinterGuardService {
 					// Remaining confirmation budget too small to be useful: defer new denies (not fail) so later
 					// watchers still run and the next cycle can finish the rest. Do not mark done; do not page.
 					// JIT closed-window / already-resolved paths above still run for every candidate.
+					// Entry was registered in the resolve pass so the sweep still sees this deferred minter.
 					const remainingBudgetMs = DENY_CYCLE_CONFIRM_BUDGET_MS - confirmBudgetSpentMs;
 					if (remainingBudgetMs < DENY_CONFIRM_MIN_USEFUL_MS) {
 						if (!deferDeniesLogged) {
@@ -542,13 +643,13 @@ export class MinterGuardService {
 						const prev = this.denyState.get(addrLc) || { attempts: 0 };
 						this.denyState.set(addrLc, { attempts: prev.attempts, done: true });
 						this.logger.warn(`denyMinter confirmed for ${address}: block=${receipt.blockNumber}`);
-						const delivered = await this.telegramService.sendCriticalAlert(
+						const successMsg =
 							`🛡️ *Minter auto-denied*\n\n` +
-								`Address: \`${address}\`\n` +
-								`Tx: \`${txHash}\`\n` +
-								`Block: ${receipt.blockNumber}\n` +
-								`Message: ${this.escapeMarkdown(message)}`
-						);
+							`Address: \`${address}\`\n` +
+							`Tx: \`${txHash}\`\n` +
+							`Block: ${receipt.blockNumber}\n` +
+							`Message: ${escapeMarkdownText(message)}`;
+						const delivered = await this.telegramService.sendCriticalAlert(this.truncateAlertBody(successMsg));
 						// Success page does not need pendingAlert retry (deny is already on-chain and marked done),
 						// but log loud when delivery fails so the gap is visible.
 						if (!delivered) {
@@ -581,17 +682,18 @@ export class MinterGuardService {
 							// FAILED critical alert ONLY on the terminal state for this minter, and only once.
 							// NotQualified must not produce a per-attempt page — the precheck owns that page.
 							// Non-terminal transient failures log at error level and stay silent on Telegram.
-							// windowClosed uses the on-chain deadline so remedy text stays truthful.
+							// windowClosed uses the live currentDeadline (not the resolve-pass value) so remedy
+							// text stays truthful after a mid-cycle mapping change.
 							if (done && !prev.alerted) {
-								const windowClosed = BigInt(Math.floor(Date.now() / 1000)) >= onChainDeadline;
+								const windowClosed = BigInt(Math.floor(Date.now() / 1000)) >= currentDeadline;
 								const remedy = windowClosed
 									? 'The application period has ended — denyMinter is impossible; challenge/handle the minter otherwise if needed.'
 									: 'Manual denyMinter() required before the application period ends.';
 								const alertMsg =
 									`⚠️ *Minter auto-deny FAILED*\n\n` +
 									`Address: \`${address}\`\n` +
-									`Class: ${this.escapeMarkdown(classification.label)} (${classification.kind})\n` +
-									`Detail: ${this.escapeMarkdown(classification.detail)}\n` +
+									`Class: ${escapeMarkdownText(classification.label)} (${classification.kind})\n` +
+									`Detail: ${escapeMarkdownText(classification.detail)}\n` +
 									`Attempts: ${attempts}/${MAX_DENY_ATTEMPTS}\n\n` +
 									remedy;
 								await this.deliverTerminalAlert(addrLc, { ...next, done: true }, alertMsg);
@@ -607,6 +709,28 @@ export class MinterGuardService {
 
 		// Pending terminal pages after deny work — notifications are not time-critical; a veto window is.
 		await this.retryPendingAlerts();
+
+		// INVARIANT: every address OBSERVED this cycle (candidateAddressSet, built from the PROPOSED /
+		// non-whitelisted / not-yet-done query above) must hold a denyState entry by now — "observation
+		// implies tracking". The resolve pass above is what establishes this for a successfully resolved
+		// candidate; this assertion exists because three separate review rounds found the same class of
+		// silent pass-through (a candidate observed but never tracked, and therefore invisible to
+		// sweepPassedUnchallenged once syncMinters relabels it APPROVED). A violation here means some path
+		// still drops a candidate without recording it — fail loud rather than patch a fourth time.
+		const untracked = [...candidateAddressSet].filter((addrLc) => this.denyState.get(addrLc) === undefined);
+		if (untracked.length > 0) {
+			this.logger.error(
+				`MinterGuard INVARIANT VIOLATED (observation implies tracking): ${untracked.length} candidate(s) ` +
+					`observed this cycle have no denyState entry: ${untracked.join(', ')}`
+			);
+			await this.maybeAlertSkip(
+				'invariant',
+				`⚠️ *Minter guard invariant violated*\n\n` +
+					`${untracked.length} candidate(s) observed this cycle were never tracked in denyState ` +
+					`(invariant: observation implies tracking): ${untracked.join(', ')}\n\n` +
+					`This is a monitoring code defect, not a chain event — investigate the resolve/send paths.`
+			);
+		}
 	}
 
 	/**
@@ -619,6 +743,10 @@ export class MinterGuardService {
 	 * out of candidates, and the "passing unchallenged" page never fires. This sweep covers exactly
 	 * those previously tracked addresses without widening the candidate query to APPROVED (which would
 	 * page once for every legitimately approved unwhitelisted minter on first run).
+	 *
+	 * Read count is capped (MAX_SWEEP_READS_PER_CYCLE) so serial minters() calls cannot stretch a cycle
+	 * past the 5-minute cadence. Resume is round-robin via sweepResumeAfter: with a fixed start, entries
+	 * beyond the cap would never be examined again.
 	 */
 	private async sweepPassedUnchallenged(juiceDollar: ethers.Contract, candidateAddresses: Set<string>): Promise<void> {
 		let latestBlock: ethers.Block | null = null;
@@ -635,19 +763,49 @@ export class MinterGuardService {
 		}
 		const blockTs = BigInt(latestBlock.timestamp);
 
-		for (const [addrLc, state] of this.denyState) {
-			if (state.done) continue;
+		// Snapshot keys once so round-robin index math is stable even if denyState mutates mid-pass.
+		const keys = [...this.denyState.keys()];
+		if (keys.length === 0) return;
+
+		// Start after the address the previous capped pass stopped at (wrap around). If the cursor is
+		// gone (entry removed) or unset, start at index 0.
+		let startIdx = 0;
+		if (this.sweepResumeAfter !== undefined) {
+			const cursorIdx = keys.indexOf(this.sweepResumeAfter);
+			if (cursorIdx >= 0) {
+				startIdx = (cursorIdx + 1) % keys.length;
+			}
+		}
+
+		let sweepReads = 0;
+		let lastExamined: string | undefined;
+		let truncated = false;
+		// Eligible keys we walked past without a minters() read (done / still-candidate) do not count
+		// toward the read cap; only actual RPC reads do.
+		for (let i = 0; i < keys.length; i++) {
+			const addrLc = keys[(startIdx + i) % keys.length];
+			const state = this.denyState.get(addrLc);
+			// Entry may have been removed (unlikely) or already marked done earlier in this pass.
+			if (!state || state.done) continue;
 			// Still in this cycle's candidate set — handled by the normal deny path.
 			if (candidateAddresses.has(addrLc)) continue;
+
+			if (sweepReads >= MAX_SWEEP_READS_PER_CYCLE) {
+				truncated = true;
+				break;
+			}
 
 			const address = ethers.getAddress(addrLc);
 			let onChainDeadline: bigint;
 			try {
+				sweepReads++;
+				lastExamined = addrLc;
 				onChainDeadline = BigInt(await juiceDollar.minters(address));
 			} catch (error) {
 				const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
 				this.logger.error(`MinterGuard sweep: failed to read minters(${address}): ${errorMsg}`);
-				// Leave entry untouched — retries next cycle.
+				// Leave entry untouched — retries next cycle. Still advance resume so a bad RPC on one
+				// address cannot pin the cursor forever.
 				continue;
 			}
 
@@ -678,10 +836,38 @@ export class MinterGuardService {
 				const alertMsg =
 					`⚠️ *Unwhitelisted minter passing unchallenged*\n\n` +
 					`Address: \`${address}\`\n` +
-					`The application period has closed (or is within the ${DENY_TOOLATE_BUFFER_SECONDS}s buffer) — ` +
-					`denyMinter is impossible; the minter will pass unless it is a bridge that can be handled otherwise.`;
+					`The application period has closed or is within the ${DENY_TOOLATE_BUFFER_SECONDS}s ` +
+					`safety buffer — a deny will no longer be attempted; the minter will pass unless it ` +
+					`is a bridge that can be handled otherwise.`;
 				await this.deliverTerminalAlert(addrLc, next, alertMsg);
 			}
+		}
+
+		// Remember where we stopped so the next cycle continues after this address (round-robin).
+		// A completed full walk still advances the cursor to the last examined key so the rotation
+		// keeps moving when the set stays larger than the cap across restarts of the pass.
+		if (lastExamined !== undefined) {
+			this.sweepResumeAfter = lastExamined;
+		}
+
+		if (truncated) {
+			// Count still-eligible keys after lastExamined until we wrap back to this pass's startIdx —
+			// those were not examined this cycle. No extra RPC.
+			let notExamined = 0;
+			const afterLast = lastExamined !== undefined ? (keys.indexOf(lastExamined) + 1) % keys.length : startIdx;
+			for (let i = 0; i < keys.length; i++) {
+				const idx = (afterLast + i) % keys.length;
+				if (idx === startIdx) break;
+				const addrLc = keys[idx];
+				const state = this.denyState.get(addrLc);
+				if (!state || state.done) continue;
+				if (candidateAddresses.has(addrLc)) continue;
+				notExamined++;
+			}
+			this.logger.warn(
+				`MinterGuard: sweep capped at ${MAX_SWEEP_READS_PER_CYCLE} minters() reads; ` +
+					`${notExamined} tracked minter(s) not examined this cycle (truncated — not a completed pass)`
+			);
 		}
 	}
 
@@ -856,8 +1042,8 @@ export class MinterGuardService {
 					'precheck',
 					`⚠️ *Minter guard pre-check failed — qualification unknown*\n\n` +
 						`${candidates.length} unwhitelisted PROPOSED minter(s) left undenied this cycle.\n` +
-						`Qualification could not be determined (class: ${this.escapeMarkdown(classification.label)}).\n` +
-						`Detail: ${this.escapeMarkdown(classification.detail)}\n\n` +
+						`Qualification could not be determined (class: ${escapeMarkdownText(classification.label)}).\n` +
+						`Detail: ${escapeMarkdownText(classification.detail)}\n\n` +
 						`The guard will retry next cycle; investigate RPC / helper set if this persists.`
 				);
 			}
@@ -868,35 +1054,154 @@ export class MinterGuardService {
 	/**
 	 * Rate-limited skip page: at most one per kind per SKIP_ALERT_COOLDOWN_MS (in-memory, reset on restart).
 	 * Kinds have independent timers so one class of page cannot suppress another.
-	 * Stamps the cooldown timer only when the page was delivered (or when telegram is disabled — nothing
-	 * to deliver to and retrying every cycle would only spam the log). A failed delivery does NOT arm
-	 * the cooldown so the next cycle can retry once Telegram recovers.
+	 *
+	 * Cooldown arming:
+	 *   - SUCCESS (or telegram disabled): stamp full SKIP_ALERT_COOLDOWN_MS — a delivered page must not
+	 *     be repeated for an hour.
+	 *   - FAILED delivery: stamp a short SKIP_ALERT_RETRY_BACKOFF_MS window so the page is retried, but
+	 *     not on every 5-minute cycle (which would be twelve attempts an hour, and per-candidate deadline
+	 *     pages could fire once per failing candidate within a single cycle's retries across cycles).
+	 * Trade-off explicit: delivered → quiet for an hour; failed → bounded retry; never a per-cycle loop.
 	 */
 	private async maybeAlertSkip(kind: SkipAlertKind, message: string): Promise<void> {
 		const nowMs = Date.now();
 		const lastAt = this.lastSkipAlertAt[kind];
 		if (nowMs - lastAt < SKIP_ALERT_COOLDOWN_MS) return;
 
-		// Telegram disabled: nothing to deliver to — stamp so we do not re-log every cycle; error log is the record.
+		// Truncate every skip-page body too — not just terminal pages (see truncateAlertBody).
+		const body = this.truncateAlertBody(message);
+
+		// Telegram disabled: nothing to deliver to — stamp full cooldown so we do not re-log every cycle.
 		if (!this.telegramService.alertsEnabled) {
 			this.lastSkipAlertAt[kind] = nowMs;
-			this.logger.error(`MinterGuard skip page not deliverable (telegram disabled): ${message}`);
+			this.logger.error(`MinterGuard skip page not deliverable (telegram disabled): ${body}`);
 			return;
 		}
 
-		const delivered = await this.telegramService.sendCriticalAlert(message);
+		const delivered = await this.telegramService.sendCriticalAlert(body);
 		if (delivered) {
 			this.lastSkipAlertAt[kind] = nowMs;
 		} else {
-			// Do not stamp: page failed and will be retried on the next cycle once Telegram recovers.
-			this.logger.error(`MinterGuard skip page failed delivery (kind=${kind}); will retry next cycle: ${message}`);
+			// Short backoff only: next attempt after SKIP_ALERT_RETRY_BACKOFF_MS (see method comment).
+			// lastAt is stored such that (now - lastAt) reaches SKIP_ALERT_COOLDOWN_MS after the backoff.
+			this.lastSkipAlertAt[kind] = nowMs - SKIP_ALERT_COOLDOWN_MS + SKIP_ALERT_RETRY_BACKOFF_MS;
+			this.logger.error(
+				`MinterGuard skip page failed delivery (kind=${kind}); will retry after ` +
+					`${SKIP_ALERT_RETRY_BACKOFF_MS}ms backoff: ${body}`
+			);
 		}
+	}
+
+	/**
+	 * Qualification half of GET /guard (and the startup probe): helper derivation, votesDelegated verdict
+	 * with seed-less retry, NoRevertData rethrow, and additive display fallback only when the contract
+	 * rejected the helper list.
+	 *
+	 * ONE SNAPSHOT when votesDelegated answers: that single number is both votingPower (for
+	 * votingPowerPct) and the qualified verdict; totalVotes comes from the same call sequence so the
+	 * ratio is internally consistent. An additive votes() sum is ONLY an estimate when the contract
+	 * refused (qualified is then false anyway) — never a second live read that can disagree with the
+	 * verdict after a helper moved equity between calls.
+	 *
+	 * Extracted so probeQualification does not depend on gas reads (getBalance / getFeeData) that live
+	 * only in getStatus — a gas-read failure must not suppress the under-quorum page.
+	 */
+	private async evaluateQualification(): Promise<{
+		qualified: boolean;
+		votingPowerPct: string;
+		helperCount: number;
+		totalVotes: bigint;
+		votingPower: bigint;
+	}> {
+		const signerAddress = this.signerAddress;
+		if (!signerAddress) {
+			throw new Error('MinterGuard evaluateQualification: signerAddress missing while guard is enabled');
+		}
+
+		const chainId = this.config.blockchainId;
+		const equityAddress = ADDRESS[chainId].equity;
+		const equity = new ethers.Contract(equityAddress, EquityABI, this.providerService.multicallProvider);
+
+		const denyIface = this.denyErrorInterface;
+		if (!denyIface) throw new Error('MinterGuard evaluateQualification: denyErrorInterface missing while guard is enabled');
+
+		const delegations = await this.eventsRepo.getDelegations();
+		const helpers = computeHelpers(delegations, signerAddress, this.helperSeed);
+
+		let activeHelpers = helpers;
+		// Definite assignment: every path below either sets these via votesDelegated or the additive fallback.
+		let qualified!: boolean;
+		let votingPower!: bigint;
+		let totalVotes!: bigint;
+		// true when votesDelegated answered (primary or seed-less); false when only the additive estimate remains.
+		let contractAnswered = false;
+
+		try {
+			// Same sequence: totalVotes then votesDelegated — single snapshot for ratio + verdict.
+			totalVotes = BigInt(await equity.totalVotes());
+			const delegatedVotes = BigInt(await equity.votesDelegated(signerAddress, helpers));
+			votingPower = delegatedVotes;
+			qualified = delegatedVotes * 10000n >= QUORUM_BPS * totalVotes;
+			contractAnswered = true;
+		} catch (error) {
+			const classification = classifyDenyError(error, denyIface);
+			if (classification.label === 'NoRevertData') {
+				// Transport/client failure, not an on-chain rejection — fail loud for the endpoint / probe.
+				throw error;
+			}
+			// EmptyRevert or decoded contract error: helper list rejected on-chain.
+			if (this.helperSeed.length > 0) {
+				const seedLess = computeHelpers(delegations, signerAddress);
+				try {
+					totalVotes = BigInt(await equity.totalVotes());
+					const delegatedVotes = BigInt(await equity.votesDelegated(signerAddress, seedLess));
+					activeHelpers = seedLess;
+					votingPower = delegatedVotes;
+					qualified = delegatedVotes * 10000n >= QUORUM_BPS * totalVotes;
+					contractAnswered = true;
+				} catch (retryError) {
+					const retryClass = classifyDenyError(retryError, denyIface);
+					if (retryClass.label === 'NoRevertData') throw retryError;
+					// Still rejected: a real deny would also revert — report qualified:false truthfully.
+					this.logger.warn(
+						`MinterGuard evaluateQualification: votesDelegated rejected helper set (${retryClass.label}): ${retryClass.detail}`
+					);
+					qualified = false;
+					activeHelpers = seedLess;
+				}
+			} else {
+				this.logger.warn(
+					`MinterGuard evaluateQualification: votesDelegated rejected helper set (${classification.label}): ${classification.detail}`
+				);
+				qualified = false;
+			}
+		}
+
+		// Contract refused: additive votes() batch is display-only estimate; qualified stays false.
+		// totalVotes and votingPower come from this same batch so the ratio stays self-consistent.
+		if (!contractAnswered) {
+			const voteResults = await this.providerService.callBatch<bigint>([
+				() => equity.totalVotes(),
+				...[signerAddress, ...activeHelpers].map((a) => () => equity.votes(a)),
+			]);
+			totalVotes = BigInt(voteResults[0]);
+			votingPower = voteResults.slice(1).reduce((sum, v) => sum + BigInt(v), 0n);
+		}
+
+		return {
+			qualified,
+			votingPowerPct: formatVotingPowerPct(votingPower, totalVotes),
+			helperCount: activeHelpers.length,
+			totalVotes,
+			votingPower,
+		};
 	}
 
 	/**
 	 * Read-only status for the GET /guard endpoint. Fail-LOUD: a genuine on-chain read error throws (5xx)
 	 * rather than faking 0%/false — the skip+alert graceful path lives only in the deny flow, never here.
 	 * The private key never leaves the backend; only the derived signer address is exposed.
+	 * Qualification comes from evaluateQualification(); gas fields are appended here only.
 	 */
 	async getStatus(): Promise<GuardResponse> {
 		const chainId = this.config.blockchainId;
@@ -920,72 +1225,8 @@ export class MinterGuardService {
 
 		const signerAddress = this.signerAddress;
 		const provider = this.providerService.provider;
-		const equity = new ethers.Contract(equityAddress, EquityABI, this.providerService.multicallProvider);
 
-		// Additive, revert-proof voting power for DISPLAY (votingPowerPct): votes(signer) + Σ votes(helper).
-		// This percentage is a display estimate over the helper set actually used for the contract verdict;
-		// `qualified` is the contract's own verdict via votesDelegated. Both now refer to the same set
-		// (recomputed below when a seed-less retry switches the active helper set) so the percentage and
-		// the verdict cannot disagree with no explanation.
-		const delegations = await this.eventsRepo.getDelegations();
-		const helpers = computeHelpers(delegations, signerAddress, this.helperSeed);
-		const voteResults = await this.providerService.callBatch<bigint>([
-			() => equity.totalVotes(),
-			...[signerAddress, ...helpers].map((a) => () => equity.votes(a)),
-		]);
-		const totalVotes: bigint = BigInt(voteResults[0]);
-		let votingPower = voteResults.slice(1).reduce((sum, v) => sum + BigInt(v), 0n);
-
-		// Contract's own verdict for `qualified` — exact value checkQualified uses.
-		// On-chain rejection of the helper list (EmptyRevert / decoded contract error): retry seed-less once.
-		// NoRevertData is a transport/client failure — rethrow so the endpoint 5xxes (fail-loud).
-		const denyIface = this.denyErrorInterface;
-		if (!denyIface) throw new Error('MinterGuard getStatus: denyErrorInterface missing while guard is enabled');
-
-		let activeHelpers = helpers;
-		let qualified: boolean;
-		try {
-			const delegatedVotes = BigInt(await equity.votesDelegated(signerAddress, helpers));
-			qualified = delegatedVotes * 10000n >= QUORUM_BPS * totalVotes;
-		} catch (error) {
-			const classification = classifyDenyError(error, denyIface);
-			if (classification.label === 'NoRevertData') {
-				// Transport/client failure, not an on-chain rejection — fail loud for the endpoint.
-				throw error;
-			}
-			// EmptyRevert or decoded contract error: helper list rejected on-chain.
-			if (this.helperSeed.length > 0) {
-				const seedLess = computeHelpers(delegations, signerAddress);
-				try {
-					const delegatedVotes = BigInt(await equity.votesDelegated(signerAddress, seedLess));
-					activeHelpers = seedLess;
-					qualified = delegatedVotes * 10000n >= QUORUM_BPS * totalVotes;
-				} catch (retryError) {
-					const retryClass = classifyDenyError(retryError, denyIface);
-					if (retryClass.label === 'NoRevertData') throw retryError;
-					// Still rejected: a real deny would also revert — report qualified:false truthfully.
-					this.logger.warn(
-						`MinterGuard getStatus: votesDelegated rejected helper set (${retryClass.label}): ${retryClass.detail}`
-					);
-					qualified = false;
-					activeHelpers = seedLess;
-				}
-			} else {
-				this.logger.warn(
-					`MinterGuard getStatus: votesDelegated rejected helper set (${classification.label}): ${classification.detail}`
-				);
-				qualified = false;
-			}
-		}
-
-		// If the contract path switched to a different helper set, recompute the additive display sum
-		// over that set so votingPowerPct, qualified and helperCount all describe the same helpers.
-		if (activeHelpers !== helpers) {
-			const powerResults = await this.providerService.callBatch<bigint>(
-				[signerAddress, ...activeHelpers].map((a) => () => equity.votes(a))
-			);
-			votingPower = powerResults.reduce((sum, v) => sum + BigInt(v), 0n);
-		}
+		const qual = await this.evaluateQualification();
 
 		// Gas status: model denyMinter() cost with a fixed gas ceiling * live fee (see DENY_GAS_ESTIMATE).
 		const balance: bigint = await provider.getBalance(signerAddress);
@@ -997,10 +1238,10 @@ export class MinterGuardService {
 		return {
 			enabled: true,
 			signerAddress,
-			votingPowerPct: formatVotingPowerPct(votingPower, totalVotes),
+			votingPowerPct: qual.votingPowerPct,
 			quorumPct: Number(QUORUM_BPS) / 100,
-			qualified,
-			helperCount: activeHelpers.length,
+			qualified: qual.qualified,
+			helperCount: qual.helperCount,
 			gasBalance: ethers.formatEther(balance),
 			estimatedDenyCost: ethers.formatEther(estimatedDenyCost),
 			gasEnough: balance >= estimatedDenyCost,

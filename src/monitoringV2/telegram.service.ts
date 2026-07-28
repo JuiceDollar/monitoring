@@ -293,3 +293,14 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 }
+
+/**
+ * Escape Telegram legacy-Markdown specials so dynamic provider/config text cannot poison
+ * parse_mode: 'Markdown' delivery (Telegram rejects malformed entities, which would make those
+ * error classes permanently undeliverable and retry the same unsendable text forever). Escapes
+ * `_`, `*`, backtick and `[` by prefixing each with a backslash. Mirrors the established pattern
+ * used for `[` in TelegramService.envTag().
+ */
+export function escapeMarkdownText(value: string): string {
+	return value.replace(/([_*`\[])/g, '\\$1');
+}
