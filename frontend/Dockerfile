@@ -18,6 +18,11 @@ ENV VITE_DEPLOYMENT_ENV=$VITE_DEPLOYMENT_ENV
 # build with --build-arg if a deployment needs a different endpoint or project.
 # The Citrea RPC is the same public endpoint the backend uses and answers browser requests
 # (access-control-allow-origin: *). The WalletConnect project id identifies the dapp to the relay.
+#
+# COUPLING: the delegate action builds its chain from the chain id the BACKEND reports at /guard, while
+# this RPC URL is fixed here. Repointing the backend at another network (BLOCKCHAIN_ID / RPC_URL) without
+# overriding VITE_RPC_URL in the same breath leaves the wallet transport talking to Citrea while the
+# declared chain id says otherwise — transactions can look unconfirmed in the UI. Change both together.
 ARG VITE_RPC_URL=https://rpc.citreascan.com
 ENV VITE_RPC_URL=$VITE_RPC_URL
 ARG VITE_WAGMI_ID=b49c3a590c4407316a6fd6eae6531e90
