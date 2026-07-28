@@ -177,6 +177,15 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	/**
+	 * Whether critical-alert delivery is configured and enabled (token + groups path present).
+	 * Callers use this to distinguish "nothing to deliver to" (disabled) from a transient
+	 * delivery failure that should be retried.
+	 */
+	get alertsEnabled(): boolean {
+		return this.enabled;
+	}
+
+	/**
 	 * Send a critical alert to every subscriber. Returns true only on confirmed delivery to
 	 * at least one chat. Returns false when telegram is disabled, no subscribers exist, or
 	 * every send failed — callers can then decide not to persist "alerted" state and retry
@@ -283,4 +292,33 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 	private sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
+}
+
+/**
+ * Escape Telegram legacy-Markdown specials so dynamic provider/config text cannot poison
+ * parse_mode: 'Markdown' delivery (Telegram rejects malformed entities, which would make those
+ * error classes permanently undeliverable and retry the same unsendable text forever). Escapes
+ * `_`, `*`, backtick and `[` by prefixing each with a backslash. Mirrors the established pattern
+ * used for `[` in TelegramService.envTag().
+ */
+export function escapeMarkdownText(value: string): string {
+	return value.replace(/([_*`\[])/g, '\\$1');
+}
+
+// Safe Telegram body length (Telegram rejects sendMessage bodies over 4096). Comfortably under the hard
+// limit so Markdown/entity overhead cannot push a page into permanent undeliverable rejection.
+// Single source of truth for every alert site (guard, monitoring bootstrap, etc.).
+export const MAX_ALERT_BODY_CHARS = 3500;
+
+/**
+ * Truncate an alert body to MAX_ALERT_BODY_CHARS so Telegram cannot permanently reject it
+ * (hard limit 4096). A truncated body always ends with an explicit marker so operators know text was cut.
+ * Applied before every store and every send — never retain an untruncated body as pendingAlert.
+ * Exported so every alert site (minter-guard, monitoring.service guard-init failure, …) can reach it;
+ * an oversized body (e.g. a configured file path interpolated verbatim) must not make the single
+ * page announcing "the guard is disabled" permanently undeliverable.
+ */
+export function truncateAlertBody(body: string): string {
+	if (body.length <= MAX_ALERT_BODY_CHARS) return body;
+	return `${body.slice(0, MAX_ALERT_BODY_CHARS)}\n\n… (truncated)`;
 }

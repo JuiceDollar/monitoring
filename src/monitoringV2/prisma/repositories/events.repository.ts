@@ -106,6 +106,41 @@ export class EventsRepository {
 		}
 	}
 
+	/**
+	 * All Equity Delegation(from, to) events, ordered ascending by (blockNumber, logIndex) so a later
+	 * event overwrites an earlier one when folded to the latest delegate per `from`. Both addresses are
+	 * lowercased defensively. Feeds the pure computeHelpers() that builds the minter-guard's dynamic
+	 * helper set.
+	 */
+	async getDelegations(): Promise<Array<{ from: string; to: string }>> {
+		try {
+			const events = await this.prisma.rawEvent.findMany({
+				where: { topic: 'Delegation' },
+				select: { args: true },
+				orderBy: [{ blockNumber: 'asc' }, { logIndex: 'asc' }],
+			});
+
+			return events
+				.map((e) => {
+					const data = e.args as any;
+					return { from: data?.from?.toLowerCase(), to: data?.to?.toLowerCase() };
+				})
+				.filter((d) => {
+					// A Delegation row missing from/to is a data anomaly (malformed args at ingest). Drop it —
+					// an incomplete edge cannot be folded into the graph — but warn so the anomaly is visible
+					// instead of silently swallowed.
+					if (!d.from || !d.to) {
+						this.logger.warn(`Discarding Delegation event with missing from/to (from=${d.from}, to=${d.to})`);
+						return false;
+					}
+					return true;
+				});
+		} catch (error) {
+			this.logger.error(`Failed to get delegations from Delegation events: ${error.message}`);
+			throw error;
+		}
+	}
+
 	async getDeniedMinters(): Promise<string[]> {
 		try {
 			const events = await this.prisma.rawEvent.findMany({

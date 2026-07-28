@@ -26,7 +26,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build --build-arg VITE_DEPLOYMENT_ENV=prd -f frontend/Dockerfile -t ${{ env.DOCKER_TAGS }} .
+        # Unset secrets are not a build failure: wallet config is read lazily inside the guard section,
+        # so the dashboard still renders and the delegate button shows "wallet delegation unavailable".
+        run: docker build --build-arg VITE_DEPLOYMENT_ENV=prd --build-arg VITE_RPC_URL=${{ secrets.VITE_RPC_URL }} --build-arg VITE_WAGMI_ID=${{ secrets.VITE_WAGMI_ID }} -f frontend/Dockerfile -t ${{ env.DOCKER_TAGS }} .
 
   deploy:
     name: Deploy Frontend to PRD
@@ -54,8 +56,12 @@ jobs:
           push: true
           tags: ${{ env.DOCKER_TAGS }}
           platforms: linux/arm64
+          # Unset secrets are not a build failure: wallet config is read lazily inside the guard section,
+          # so the dashboard still renders and the delegate button shows "wallet delegation unavailable".
           build-args: |
             VITE_DEPLOYMENT_ENV=prd
+            VITE_RPC_URL=${{ secrets.VITE_RPC_URL }}
+            VITE_WAGMI_ID=${{ secrets.VITE_WAGMI_ID }}
 
       - name: Install cloudflared
         run: |

@@ -10,9 +10,9 @@ import { PositionService } from './position.service';
 import { ChallengeService } from './challenge.service';
 import { CollateralService } from './collateral.service';
 import { MinterService } from './minter.service';
-import { MinterGuardService } from './minter-guard.service';
+import { MinterGuardService, GuardConfigError } from './minter-guard.service';
 import { JusdService } from './jusd.service';
-import { TelegramService } from './telegram.service';
+import { TelegramService, escapeMarkdownText, truncateAlertBody } from './telegram.service';
 
 @Injectable()
 export class MonitoringService implements OnModuleInit {
@@ -44,7 +44,34 @@ export class MonitoringService implements OnModuleInit {
 		await this.positionService.initialize();
 		await this.challengeService.initialize();
 		await this.minterService.initialize();
-		await this.minterGuardService.initialize();
+		// Never let a guard init failure abort the whole monitoring process. A CONFIG error
+		// (missing/invalid GUARD_PRIVATE_KEY) still fails loud and aborts bootstrap — no silent
+		// fallback. Any other init failure (e.g. a bad whitelist file) leaves the guard disabled
+		// and pages once, while the rest of monitoring keeps running.
+		try {
+			await this.minterGuardService.initialize();
+		} catch (error) {
+			if (error instanceof GuardConfigError) throw error;
+			const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
+			this.logger.error(`MinterGuard init failed — guard DISABLED, monitoring continues: ${errorMsg}`, error?.stack || error);
+			// One-shot bootstrap path, not a per-cycle watcher: no retry machinery here (unlike the guard's
+			// own per-cycle pendingAlert retry) — this logger.error is the durable record if delivery fails.
+			// Truncated as well as escaped: errorMsg can carry unbounded input (loadWhitelist embeds the
+			// configured path verbatim), and Telegram rejects a body over its length limit outright — which
+			// would make the single page announcing a disabled guard permanently undeliverable.
+			const delivered = await this.telegramService.sendCriticalAlert(
+				truncateAlertBody(
+					`⚠️ *Minter guard init failed — guard DISABLED*\n\n` +
+						`The auto-deny guard is OFF for this run; monitoring continues.\n` +
+						`Error: ${escapeMarkdownText(errorMsg)}`
+				)
+			);
+			if (!delivered) {
+				this.logger.error(
+					`MinterGuard init-failure page could not be delivered — guard is OFF for this run with no notification sent`
+				);
+			}
+		}
 		await this.jusdService.initialize();
 		setTimeout(() => this.runMonitoring(), 5000);
 	}

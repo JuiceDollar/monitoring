@@ -5,6 +5,7 @@ import {
 	ChallengeResponse,
 	ChallengeStatus,
 	CollateralResponse,
+	GuardResponse,
 	HealthResponse,
 	PositionResponse,
 	PositionStatus,
@@ -17,6 +18,7 @@ import type { Token, PositionState } from '@prisma/client';
 import { Decimal } from '@prisma/client/runtime/library';
 import { ProviderService } from '../provider.service';
 import { MonitoringService } from '../monitoring.service';
+import { MinterGuardService } from '../minter-guard.service';
 import { AppConfigService } from 'src/config/config.service';
 
 const jusdDecimals = 18;
@@ -28,6 +30,7 @@ export class ApiController {
 		private readonly prisma: PrismaClientService,
 		private readonly providerService: ProviderService,
 		private readonly monitoringService: MonitoringService,
+		private readonly minterGuardService: MinterGuardService,
 		private readonly config: AppConfigService
 	) {}
 
@@ -51,6 +54,14 @@ export class ApiController {
 			updatedAt: syncState?.timestamp?.getTime().toString() || '0',
 			rpcStats: this.providerService.getRpcStats(),
 		};
+	}
+
+	@Get('guard')
+	@ApiOperation({ summary: 'Get minter-guard delegation status' })
+	@ApiResponse({ status: 200, description: 'Guard signer address, live voting-power %, qualification and gas status' })
+	async getGuardStatus(): Promise<GuardResponse> {
+		// Fail-loud: getStatus() throws on a genuine on-chain read failure (5xx) rather than faking 0%/false.
+		return this.minterGuardService.getStatus();
 	}
 
 	@Get('positions')
