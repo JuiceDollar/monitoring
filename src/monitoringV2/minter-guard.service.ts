@@ -684,11 +684,14 @@ export class MinterGuardService {
 			if (precheck.ok) {
 				const helpers = precheck.helpers;
 				// Cycle-level tip / legacy gas price only — each send builds its own fee overrides from the
-				// block it just read for the TooLate window check (see denyFeeFor in the send path). The
-				// pre-check floor prices ONE deny against the block it used; a cycle can send several, so a
-				// signer funded for exactly one deny can still fail a later send for funds (ordinary
-				// per-candidate failure, not the dedicated gas page).
+				// block it just read for the TooLate window check (see denyFeeFor in the send path). balance
+				// is the pre-check's own snapshot, reused without a further chain call: within the cycle it
+				// can only decrease through this guard's own denies (confirmed denies happen serially in
+				// this loop before the next candidate is examined). Each send below checks affordability
+				// against THIS balance and the fee that specific send is about to carry, right before
+				// submitting it.
 				const feeInputs = precheck.feeInputs;
+				const balance = precheck.balance;
 
 				let deferDeniesLogged = false;
 				let candidatesStarted = 0;
@@ -815,9 +818,35 @@ export class MinterGuardService {
 						// WHY not ethers getFeeData for the tip: pinned ethers 6.7.1 hardcodes a 1 gwei priority
 						// fee while Citrea base fee is ~0.001 gwei, so an unchecked getFeeData path inflated the
 						// EIP-1559 reservation ~1000× and made a well-funded signer (e.g. 0.0000093 cBTC) look
-						// broke. The pre-check floor is for ONE deny only — a later send in the same cycle can
-						// still be rejected for funds after a green pre-check (ordinary per-candidate failure).
-						const { overrides } = this.denyFeeFor(latestBlock.baseFeePerGas, feeInputs);
+						// broke. The node enforces the reservation against the fee the transaction actually
+						// carries, so the only affordability check that cannot be stale is the one made against
+						// that same fee, from the same block — which is the check directly below. Because of
+						// that check, a base-fee rise between the pre-check and this send can no longer cause a
+						// funds rejection, for the first send or any later one in the cycle. What remains (any
+						// read-then-broadcast scheme) is that the base fee can still move between THIS read
+						// and actual inclusion: the baseFeePerGas * 2n cap in denyFeeFor absorbs a doubling;
+						// beyond that the tx simply will not be mined at that cap and is retried next cycle —
+						// it is not a funds rejection. The pre-check floor remains a cheap cycle-level gate
+						// that avoids per-candidate work for an obviously unfunded signer; the per-send check
+						// below is the affordability guarantee.
+						const { feePerGas, overrides } = this.denyFeeFor(latestBlock.baseFeePerGas, feeInputs);
+						const reservation = denyGasCeiling(helpers.length) * feePerGas;
+						if (reservation > balance) {
+							this.logger.warn(
+								`MinterGuard: deferring deny of ${address} — reservation ` +
+									`${ethers.formatEther(reservation)} cBTC exceeds balance ` +
+									`${ethers.formatEther(balance)} cBTC (not marked done — deferred, not a failure)`
+							);
+							await this.maybeAlertSkip(
+								'gas',
+								`⚠️ *Minter guard low on cBTC — deny deferred*\n\n` +
+									`Candidate: \`${address}\`\n` +
+									`Required reservation: ${ethers.formatEther(reservation)} cBTC\n` +
+									`Balance: ${ethers.formatEther(balance)} cBTC\n\n` +
+									`Fund the signer with cBTC.`
+							);
+							continue;
+						}
 						const tx = await juiceDollar.denyMinter(address, helpers, message, overrides);
 						txHash = tx.hash;
 						this.logger.warn(`Submitted denyMinter for ${address}: tx=${tx.hash}`);
@@ -1279,11 +1308,12 @@ export class MinterGuardService {
 
 	/**
 	 * Signer-global deny pre-check, run once per cycle before any denyMinter(). Returns
-	 * { ok, helpers, feeInputs, overrides? }:
-	 *   - ok=true  => helpers and cycle-level feeInputs are ready; proceed to per-candidate deny loop
-	 *     (each send builds its own overrides via denyFeeFor against the block it just read). overrides
-	 *     are the pre-check's own balance-floor pricing (one deny against the pre-check block) — useful
-	 *     as a starting value, not as a cycle-wide send cap.
+	 * { ok, helpers, feeInputs, overrides?, balance? }:
+	 *   - ok=true  => helpers, cycle-level feeInputs, and the pre-check balance snapshot are ready;
+	 *     proceed to per-candidate deny loop (each send builds its own overrides via denyFeeFor against
+	 *     the block it just read, and checks affordability against balance). overrides are the
+	 *     pre-check's own balance-floor pricing (one deny against the pre-check block) — useful as a
+	 *     starting value, not as a cycle-wide send cap.
 	 *   - ok=false => SKIP all denies this cycle. Paths that produce ok=false:
 	 *       * cycle budget already below DENY_CONFIRM_MIN_USEFUL_MS at entry — defer (warn, no page),
 	 *       * cycle deadline exhausted between sequential pre-check chain calls — defer (warn, no page),
@@ -1302,7 +1332,13 @@ export class MinterGuardService {
 		candidates: Array<{ address: string }>,
 		cycleStartedAt: number
 	): Promise<
-		| { ok: true; helpers: string[]; feeInputs: { tip: bigint | null; legacyGasPrice: bigint | null }; overrides: ethers.Overrides }
+		| {
+				ok: true;
+				helpers: string[];
+				feeInputs: { tip: bigint | null; legacyGasPrice: bigint | null };
+				overrides: ethers.Overrides;
+				balance: bigint;
+		  }
 		| { ok: false; helpers: string[] }
 	> {
 		// Honour the single cycle deadline before any pre-check RPC: if remaining budget is below the
@@ -1565,7 +1601,7 @@ export class MinterGuardService {
 				);
 			}
 
-			return { ok: true, helpers, feeInputs, overrides };
+			return { ok: true, helpers, feeInputs, overrides, balance };
 		} catch (error) {
 			// Unusable pre-check (RPC failure, or votesDelegated still failing with no usable seed-less set):
 			// skip this cycle (logged, not silently swallowed). When candidates exist, also page under the
