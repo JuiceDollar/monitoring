@@ -678,8 +678,26 @@ export class MinterGuardService {
 				const helpers = precheck.helpers;
 
 				let deferDeniesLogged = false;
+				let candidatesStarted = 0;
 
 				for (const { address, onChainDeadline: resolveDeadline } of workingSet) {
+					// Cycle-deadline guard BEFORE the two just-in-time reads — distinct from the send-budget
+					// gate further down (that one still allows diagnostics when confirmation-wait budget is
+					// too small; this one refuses to start either read once the cycle is already over budget).
+					// Bound: the loop can still overshoot the cycle deadline by at most one in-flight read
+					// (same as the resolve pass); an outstanding RPC cannot be cancelled, so the deadline is
+					// meaningful rather than exact.
+					if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+						const remaining = workingSet.length - candidatesStarted;
+						this.logger.warn(
+							`MinterGuard: cycle deadline reached before deny-candidate JIT reads; ` +
+								`${remaining} remaining candidate(s) not examined this cycle ` +
+								`(not marked done, no page — deferred to next cycle).`
+						);
+						break;
+					}
+					candidatesStarted++;
+
 					const addrLc = address.toLowerCase();
 
 					// Just-in-time TooLate / already-resolved guard. denyMinter reverts TooLate once
@@ -702,6 +720,15 @@ export class MinterGuardService {
 					let currentDeadline: bigint;
 					try {
 						latestBlock = await this.providerService.provider.getBlock('latest');
+						// Same cycle-deadline discipline as the top-of-loop guard: a single slow getBlock must
+						// not be compounded by a second minters() read once the budget is already gone.
+						if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+							this.logger.warn(
+								`MinterGuard skip ${address}: cycle deadline reached between getBlock and minters() ` +
+									`(not marked done, no page — deferred to next cycle)`
+							);
+							continue;
+						}
 						currentDeadline = BigInt(await juiceDollar.minters(address));
 					} catch (error) {
 						const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
