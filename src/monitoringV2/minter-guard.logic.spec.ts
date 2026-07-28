@@ -221,6 +221,54 @@ describe('classifyDenyError', () => {
 		expect(result.detail).toMatch(/helper/i);
 	});
 
+	it('classifies a mined receipt revert (data null + receipt) as RevertedOnChain, not EmptyRevert', () => {
+		// ethers v6 checkReceipt: status===0 always throws CALL_EXCEPTION with data:null and a receipt,
+		// regardless of the real revert reason — must not be diagnosed as a helper-list rejection.
+		const hash = '0x' + 'ab'.repeat(32);
+		const error = {
+			message: 'transaction execution reverted',
+			code: 'CALL_EXCEPTION',
+			data: null,
+			receipt: { status: 0, hash },
+		};
+		const result = classifyDenyError(error, iface);
+		expect(result.kind).toBe('transient');
+		expect(result.label).toBe('RevertedOnChain');
+		// The detail may mention the helper list — it says the revert is NOT evidence of one. What it must
+		// never carry is the pre-send diagnosis wording, which would send the operator after the wrong cause.
+		expect(result.detail).not.toMatch(/unsorted|duplicated|does NOT delegate/i);
+		expect(result.detail).toMatch(/mined/i);
+		expect(result.detail).toContain(hash);
+	});
+
+	it('classifies the same CALL_EXCEPTION shape without a receipt as EmptyRevert (eth_call path)', () => {
+		// Pre-send eth_call / estimateGas bare require: no receipt, data-less CALL_EXCEPTION —
+		// that is the helper-list rejection surface, distinct from a mined status===0 receipt.
+		const error = {
+			message: 'transaction execution reverted',
+			code: 'CALL_EXCEPTION',
+			data: null,
+		};
+		const result = classifyDenyError(error, iface);
+		expect(result.kind).toBe('transient');
+		expect(result.label).toBe('EmptyRevert');
+		expect(result.detail).toMatch(/helper/i);
+	});
+
+	it('prefers decoded TooLate over RevertedOnChain when a mined receipt also carries error data', () => {
+		// Some providers attach both receipt and decodable data on a mined revert; permanent TooLate
+		// is strictly more useful than the generic mined-revert class, so decode wins.
+		const error = {
+			message: 'transaction execution reverted',
+			code: 'CALL_EXCEPTION',
+			data: tooLateData,
+			receipt: { status: 0, hash: '0x' + 'cd'.repeat(32) },
+		};
+		const result = classifyDenyError(error, iface);
+		expect(result.kind).toBe('permanent');
+		expect(result.label).toBe('TooLate');
+	});
+
 	it('classifies NETWORK_ERROR with no data as NoRevertData and names the code', () => {
 		const error = { message: 'could not detect network', code: 'NETWORK_ERROR' };
 		const result = classifyDenyError(error, iface);

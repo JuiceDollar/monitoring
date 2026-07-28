@@ -177,6 +177,15 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 	}
 
 	/**
+	 * Whether critical-alert delivery is configured and enabled (token + groups path present).
+	 * Callers use this to distinguish "nothing to deliver to" (disabled) from a transient
+	 * delivery failure that should be retried.
+	 */
+	get alertsEnabled(): boolean {
+		return this.enabled;
+	}
+
+	/**
 	 * Send a critical alert to every subscriber. Returns true only on confirmed delivery to
 	 * at least one chat. Returns false when telegram is disabled, no subscribers exist, or
 	 * every send failed — callers can then decide not to persist "alerted" state and retry

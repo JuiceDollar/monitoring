@@ -5,7 +5,7 @@ export const QUORUM_BPS = 200n;
 
 export interface DenyErrorClass {
 	kind: 'permanent' | 'transient';
-	label: string; // 'TooLate' | 'NotQualified' | 'EmptyRevert' | 'NoRevertData' | a decoded error name | 'Unknown'
+	label: string; // 'TooLate' | 'NotQualified' | 'EmptyRevert' | 'RevertedOnChain' | 'NoRevertData' | a decoded error name | 'Unknown'
 	detail: string; // human-readable diagnosis for logs + Telegram
 }
 
@@ -78,9 +78,14 @@ export function computeHelpers(delegations: Array<{ from: string; to: string }>,
 /**
  * Classifies a failed denyMinter/votesDelegated error into permanent vs transient with a diagnosis.
  *
+ * Separates three failure surfaces:
+ *   - eth_call / estimateGas bare require (empty revert data) — helper-list rejection before send,
+ *   - mined receipt with status === 0 — ethers reports data:null even when a custom error fired,
+ *   - client/transport/account failure — no on-chain revert marker at all.
+ *
  * Permanent (TooLate): the application window has closed — retrying forever is useless and would only
- * burn gas + page. Transient: under-quorum, helper-list rejection, RPC blips, unknown — may recover
- * next cycle (or after operator action) within the attempt cap.
+ * burn gas + page. Transient: under-quorum, helper-list rejection, mined-but-reverted, RPC blips,
+ * unknown — may recover next cycle (or after operator action) within the attempt cap.
  */
 export function classifyDenyError(error: unknown, iface: ethers.Interface): DenyErrorClass {
 	const err = error as any;
@@ -96,7 +101,7 @@ export function classifyDenyError(error: unknown, iface: ethers.Interface): Deny
 		}
 	}
 
-	// Empty-data on-chain revert diagnosis (shared by steps 1–2 below).
+	// Empty-data on-chain revert diagnosis (shared by the eth_call empty-data steps below).
 	// Equity.votesDelegated uses BARE requires that revert with NO data:
 	//   require(_checkDuplicatesAndSorted(helpers))
 	//   require(current != sender)
@@ -110,74 +115,102 @@ export function classifyDenyError(error: unknown, iface: ethers.Interface): Deny
 			'equals the signer, or does NOT delegate to the signer (this is NOT an RPC fault).',
 	};
 
-	// 1. A data candidate exists and is exactly empty hex ('0x' / '0X') -> real empty-data revert.
+	// 1. Non-empty data candidate (not bare '0x'): decode first.
+	// Precedence: a mined revert can carry BOTH a receipt and a decodable data payload (some providers
+	// attach data even on status===0). A permanent TooLate is strictly more useful than the generic
+	// RevertedOnChain class, so decode wins when both are present.
+	if (data !== undefined && data !== '0x' && data !== '0X') {
+		try {
+			const parsed = iface.parseError(data);
+			if (parsed) {
+				const name = parsed.name;
+				if (name === 'TooLate') {
+					return {
+						kind: 'permanent',
+						label: 'TooLate',
+						detail:
+							'The application period has expired; denyMinter is impossible for anyone now — ' +
+							'the minter will pass unless it is a bridge that can be handled otherwise.',
+					};
+				}
+				if (name === 'NotQualified') {
+					return {
+						kind: 'transient',
+						label: 'NotQualified',
+						detail:
+							'The signer is under the 2% Equity quorum; delegation can fix this at runtime ' +
+							'(delegateVoteTo the guard signer, or fund the signer with JUICE).',
+					};
+				}
+				const args = parsed.args?.length ? ` args=${parsed.args.map((a) => String(a)).join(',')}` : '';
+				return {
+					kind: 'transient',
+					label: name,
+					detail: `Decoded on-chain error ${name}${args}`,
+				};
+			}
+		} catch {
+			// Not a decodable custom error — fall through to Unknown.
+		}
+
+		return {
+			kind: 'transient',
+			label: 'Unknown',
+			detail: message,
+		};
+	}
+
+	// 2. Mined receipt revert (ethers checkReceipt: status===0 throws CALL_EXCEPTION with data:null
+	// and a receipt). Distinct from eth_call empty-data EmptyRevert — NOT a helper-list signal.
+	// kind stays transient: the authoritative on-chain window check at the start of the next cycle
+	// decides whether anything is still deniable.
+	const receipt = err?.receipt;
+	if (receipt !== null && typeof receipt === 'object') {
+		// ethers receipt uses `.hash`; some shapes expose `.transactionHash` instead.
+		let hashSuffix = '';
+		if (typeof receipt.hash === 'string') {
+			hashSuffix = ` tx=${receipt.hash}`;
+		} else if (typeof receipt.transactionHash === 'string') {
+			hashSuffix = ` tx=${receipt.transactionHash}`;
+		}
+		return {
+			kind: 'transient',
+			label: 'RevertedOnChain',
+			detail:
+				'Transaction was mined and reverted; ethers reports data:null for mined reverts so the ' +
+				'revert reason is not recoverable from the receipt. Realistic causes (most likely first): ' +
+				'application window closed before inclusion (TooLate), qualification lost between pre-check ' +
+				'and inclusion (NotQualified), or the application was already resolved by someone else. ' +
+				'This is NOT evidence of a malformed helper list.' +
+				hashSuffix,
+		};
+	}
+
+	// 3. A data candidate exists and is exactly empty hex ('0x' / '0X') -> real empty-data eth_call revert.
 	if (data === '0x' || data === '0X') {
 		return emptyRevert;
 	}
 
-	// 2. No data candidate, but still recognisably an on-chain revert -> EmptyRevert.
+	// 4. No data candidate, but still recognisably an on-chain revert -> EmptyRevert.
 	// ethers v6 surfaces a data-less CALL_EXCEPTION / "missing revert data" this way, which is what
-	// distinguishes a real empty-data revert from a client/transport failure (no data, no revert marker).
-	if (data === undefined) {
-		const code = err?.code;
-		const isOnChainEmptyRevert = message.toLowerCase().includes('missing revert data') || code === 'CALL_EXCEPTION';
-		if (isOnChainEmptyRevert) {
-			return emptyRevert;
-		}
-
-		// 3. No data candidate and no revert marker -> client/transport/account failure, not a helper-list
-		// rejection. This class exists so we do NOT attribute network/nonce/timeout faults to the helper
-		// list (which would send the operator after GUARD_HELPER_ADDRESS and trip the pre-check seed-drop).
-		const codeSuffix = typeof code === 'string' && code.length > 0 ? ` code=${code}` : '';
-		return {
-			kind: 'transient',
-			label: 'NoRevertData',
-			detail:
-				'Not a contract rejection: client/transport/account-level failure ' +
-				'(nonce, funds at send time, timeout, network, or user rejection). ' +
-				`Raw error: ${message}${codeSuffix}`,
-		};
+	// distinguishes a real empty-data eth_call revert from a client/transport failure (no data, no
+	// revert marker). Reached only when there is no mined receipt (step 2 above).
+	const code = err?.code;
+	const isOnChainEmptyRevert = message.toLowerCase().includes('missing revert data') || code === 'CALL_EXCEPTION';
+	if (isOnChainEmptyRevert) {
+		return emptyRevert;
 	}
 
-	// 4. Decodable custom error (TooLate on JuiceDollar, NotQualified on Equity, …).
-	// Reached only when a non-empty data candidate exists — TooLate/NotQualified can never be
-	// swallowed by steps 1–3 above.
-	try {
-		const parsed = iface.parseError(data);
-		if (parsed) {
-			const name = parsed.name;
-			if (name === 'TooLate') {
-				return {
-					kind: 'permanent',
-					label: 'TooLate',
-					detail:
-						'The application period has expired; denyMinter is impossible for anyone now — ' +
-						'the minter will pass unless it is a bridge that can be handled otherwise.',
-				};
-			}
-			if (name === 'NotQualified') {
-				return {
-					kind: 'transient',
-					label: 'NotQualified',
-					detail:
-						'The signer is under the 2% Equity quorum; delegation can fix this at runtime ' +
-						'(delegateVoteTo the guard signer, or fund the signer with JUICE).',
-				};
-			}
-			const args = parsed.args?.length ? ` args=${parsed.args.map((a) => String(a)).join(',')}` : '';
-			return {
-				kind: 'transient',
-				label: name,
-				detail: `Decoded on-chain error ${name}${args}`,
-			};
-		}
-	} catch {
-		// Not a decodable custom error — fall through to Unknown.
-	}
-
+	// 5. No data candidate and no revert marker -> client/transport/account failure, not a helper-list
+	// rejection. This class exists so we do NOT attribute network/nonce/timeout faults to the helper
+	// list (which would send the operator after GUARD_HELPER_ADDRESS and trip the pre-check seed-drop).
+	const codeSuffix = typeof code === 'string' && code.length > 0 ? ` code=${code}` : '';
 	return {
 		kind: 'transient',
-		label: 'Unknown',
-		detail: message,
+		label: 'NoRevertData',
+		detail:
+			'Not a contract rejection: client/transport/account-level failure ' +
+			'(nonce, funds at send time, timeout, network, or user rejection). ' +
+			`Raw error: ${message}${codeSuffix}`,
 	};
 }

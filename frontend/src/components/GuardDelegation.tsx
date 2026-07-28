@@ -65,8 +65,8 @@ export function GuardDelegation({ guard }: { guard?: DataState<GuardResponse> })
 						To act it needs at least {data.quorumPct}% of Equity voting power. Delegating your JUICE votes to the guard
 						signer is <span className={colors.text.primary}>non-custodial and additive</span>: your JUICE stays in your
 						wallet and your own voting power is unchanged. Unlike the usual (Governor-style) delegation that moves your
-						power to the delegate, here the guard is only allowed to also count your votes toward the quorum — the signer
-						holds no JUICE itself, so its veto power comes entirely from delegators. You can re-delegate at any time.
+						power to the delegate, here the guard is only allowed to also count your votes toward the quorum — the
+						signer's qualification is its own votes plus the votes delegated to it. You can re-delegate at any time.
 					</p>
 
 					{signerActive ? (
