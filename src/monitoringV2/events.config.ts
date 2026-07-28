@@ -26,6 +26,10 @@ export const EVENT_CONFIG: Record<string, EventConfig> = {
 
 	// Trading events
 	Trade: { severity: EventSeverity.LOW, enabled: false },
+	// Delegation rows feed the minter-guard helper set (computeHelpers). They are persisted regardless of
+	// this flag — ingestion is driven by EVENT_SIGNATURES in constants.ts, while `enabled` only gates
+	// Telegram alerting (telegram.service.notifyEvent). Keep it false: a delegation is routine and must
+	// not page. Do not remove the entry — the guard depends on these rows being indexed.
 	Delegation: { severity: EventSeverity.LOW, enabled: false },
 
 	// Roll event

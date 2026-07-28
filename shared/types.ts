@@ -145,3 +145,20 @@ export interface MinterResponse {
 	bridgeMinted?: string;
 	bridgeHorizon?: string; // Unix timestamp in milliseconds as string
 }
+
+// Minter-guard delegation status (GET /guard). All bigints are stringified. The private key never
+// leaves the backend — only the derived signer address is exposed. This shape is the backend<->frontend
+// contract and MUST stay byte-identical on both sides.
+export interface GuardResponse {
+	enabled: boolean;
+	signerAddress: string;
+	votingPowerPct: string; // percent, e.g. "1.85"
+	quorumPct: number; // qualification threshold in percent (2)
+	qualified: boolean;
+	helperCount: number; // helpers contributed by the Delegation graph + the optional static seed
+	gasBalance: string; // signer balance in native units (Citrea: cBTC, 18 decimals)
+	estimatedDenyCost: string; // modelled denyMinter() cost in native units
+	gasEnough: boolean;
+	equityAddress: string;
+	chainId: number;
+}
