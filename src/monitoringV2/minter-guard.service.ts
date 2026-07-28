@@ -400,6 +400,8 @@ export class MinterGuardService {
 	 * On a failed terminal retry the entry is delete+re-set so Map insertion order moves it to the end: the
 	 * next cycle starts with pages not tried recently. Without rotation, five permanently failing entries at
 	 * the front of the map would starve every later pending page indefinitely under the per-cycle cap.
+	 * The same delete+re-set rotation applies to failed skip-page retries for the same reason (deadline pages
+	 * are keyed per minter, so more than MAX_ALERT_RETRIES_PER_CYCLE skip entries is now plausible).
 	 */
 	private async retryPendingAlerts(cycleStartedAt: number): Promise<void> {
 		const pending: Array<[string, DenyStateEntry]> = [];
@@ -500,6 +502,11 @@ export class MinterGuardService {
 				this.lastSkipAlertAt[kind] = Date.now();
 			} else {
 				// Keep retained body for the next cycle; short backoff so maybeAlertSkip path stays bounded too.
+				// Rotate failed retries to the end of Map iteration order (starvation prevention — same as
+				// the terminal loop above). Without rotation, five permanently failing skip entries at the
+				// front would starve every later pending skip page indefinitely under the per-cycle cap —
+				// now plausible because deadline pages are keyed per minter.
+				this.pendingSkipAlerts.delete(retentionKey);
 				this.pendingSkipAlerts.set(retentionKey, body);
 				this.lastSkipAlertAt[kind] = Date.now() - SKIP_ALERT_COOLDOWN_MS + SKIP_ALERT_RETRY_BACKOFF_MS;
 				this.logger.error(`MinterGuard skip page retry failed delivery (key=${retentionKey}); retained for next cycle: ${body}`);
@@ -666,7 +673,7 @@ export class MinterGuardService {
 
 			// Signer-global pre-check (once per cycle, before any deny): verify quorum + gas and build helpers.
 			// Count is the number of genuinely actionable minters after the resolve pass.
-			const precheck = await this.runDenyPrecheck(signerAddress, wallet, workingSet);
+			const precheck = await this.runDenyPrecheck(signerAddress, wallet, workingSet, cycleStartedAt);
 			if (precheck.ok) {
 				const helpers = precheck.helpers;
 
@@ -675,27 +682,6 @@ export class MinterGuardService {
 				for (const { address, onChainDeadline: resolveDeadline } of workingSet) {
 					const addrLc = address.toLowerCase();
 
-					// Remaining cycle budget too small to be useful: defer new denies (not fail) so the sweep
-					// and pending-alert retry still run and the next cycle can finish the rest. Do not mark
-					// done; do not page. Checked BEFORE the JIT getBlock/minters reads so those previously
-					// unbounded-per-candidate RPCs cannot overrun the cycle deadline (the failure the single
-					// CYCLE_BUDGET_MS deadline exists to prevent).
-					// Entry was registered BEFORE the resolve pass (RPC-free bookkeeping at the start of
-					// checkAndDeny) so a resolve-pass failure or timeout cannot leave a candidate untracked —
-					// the sweep still sees this deferred minter.
-					const remainingBudgetMs = this.cycleRemainingMs(cycleStartedAt);
-					if (remainingBudgetMs < DENY_CONFIRM_MIN_USEFUL_MS) {
-						if (!deferDeniesLogged) {
-							this.logger.warn(
-								`MinterGuard: cycle budget exhausted (${CYCLE_BUDGET_MS - remainingBudgetMs}ms spent of ` +
-									`${CYCLE_BUDGET_MS}ms); deferring remaining deny candidate(s) including ${address} ` +
-									`to the next cycle (not marked done, no page — deferral is not a failure).`
-							);
-							deferDeniesLogged = true;
-						}
-						continue;
-					}
-
 					// Just-in-time TooLate / already-resolved guard. denyMinter reverts TooLate once
 					// block.timestamp > minters[_minter]. Re-read BOTH the live block timestamp and the
 					// on-chain deadline immediately before send: the resolve-pass deadline is stale once
@@ -703,6 +689,15 @@ export class MinterGuardService {
 					// candidate's confirmation. Sending with a stale deadline reverts, marks the minter
 					// permanently failed, and pages "manual denyMinter() required" for a minter already denied.
 					// currentDeadline is the authoritative value for buffer comparison and windowClosed text.
+					//
+					// These cheap diagnostics run BEFORE the send-budget gate: the working set is sorted
+					// soonest-deadline-first, so a candidate whose window is closing right now must still
+					// be recorded and paged ("passing unchallenged") even when remaining budget is too
+					// small to send. Deferring before these reads would silently drop the most urgent
+					// candidate — the failure this ordering prevents.
+					// Entry was registered BEFORE the resolve pass (RPC-free bookkeeping at the start of
+					// checkAndDeny) so a resolve-pass failure or timeout cannot leave a candidate untracked —
+					// the sweep still sees this deferred minter.
 					let latestBlock: ethers.Block | null = null;
 					let currentDeadline: bigint;
 					try {
@@ -751,12 +746,34 @@ export class MinterGuardService {
 						continue;
 					}
 
+					// Gate on SENDING, not on the candidate: remaining cycle budget too small for a useful
+					// confirmation wait — defer the deny (not fail) so the sweep and pending-alert retry still
+					// run and the next cycle can finish the rest. Do not mark done; do not page. Candidate
+					// stays tracked and is actionable again next cycle. Diagnostics above already ran.
+					const remainingBudgetMs = this.cycleRemainingMs(cycleStartedAt);
+					if (remainingBudgetMs < DENY_CONFIRM_MIN_USEFUL_MS) {
+						if (!deferDeniesLogged) {
+							this.logger.warn(
+								`MinterGuard: cycle budget exhausted (${CYCLE_BUDGET_MS - remainingBudgetMs}ms spent of ` +
+									`${CYCLE_BUDGET_MS}ms); deferring remaining deny send(s) including ${address} ` +
+									`to the next cycle (not marked done, no page — deferral is not a failure).`
+							);
+							deferDeniesLogged = true;
+						}
+						continue;
+					}
+
 					const envLabel = `${this.config.environment ?? 'unknown'}/${this.config.chain ?? 'unknown'}`;
 					const message = `Auto-deny by minter-guard: not in whitelist (${envLabel})`;
 					let confirmed = false;
 					let txHash: string | undefined;
 					// Per-tx wait capped by whatever is left of the cycle deadline, so a slow confirmation
 					// cannot push the cycle past the cadence.
+					// INVARIANT: the send-budget gate above guarantees remainingBudgetMs >= DENY_CONFIRM_MIN_USEFUL_MS
+					// at this point, so waitTimeoutMs is always positive. A non-positive timeout must never be
+					// submitted: ethers passes it to setTimeout, Node clamps it to ~1 ms, tx.wait rejects almost
+					// immediately after the tx is already in-flight — burning a MAX_DENY_ATTEMPTS slot and risking
+					// a redundant fresh-nonce resend for a deny that may confirm on its own.
 					const waitTimeoutMs = Math.min(DENY_CONFIRM_TIMEOUT_MS, this.cycleRemainingMs(cycleStartedAt));
 					try {
 						const tx = await juiceDollar.denyMinter(address, helpers, message);
@@ -927,6 +944,14 @@ export class MinterGuardService {
 		candidateAddresses: Set<string>,
 		cycleStartedAt: number
 	): Promise<void> {
+		// Honour the single cycle deadline BEFORE the initial getBlock so the sweep cannot start work
+		// it has no time for (the cycle-wide invariant: every pass derives remaining time from the
+		// deadline). Mid-pass deadline checks below still stop further minters() reads.
+		if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+			this.logger.warn(`MinterGuard: sweep skipped (cycle deadline ${CYCLE_BUDGET_MS}ms); no tracked minters examined this cycle`);
+			return;
+		}
+
 		let latestBlock: ethers.Block | null = null;
 		try {
 			latestBlock = await this.providerService.provider.getBlock('latest');
@@ -1064,6 +1089,7 @@ export class MinterGuardService {
 	 * Signer-global deny pre-check, run once per cycle before any denyMinter(). Returns { ok, helpers }:
 	 *   - ok=true  => helpers are ready; proceed to per-candidate deny loop.
 	 *   - ok=false => SKIP all denies this cycle. Paths that produce ok=false:
+	 *       * cycle budget already below DENY_CONFIRM_MIN_USEFUL_MS at entry — defer (warn, no page),
 	 *       * under quorum (votes) — rate-limited 'votes' page when candidates exist,
 	 *       * low gas — rate-limited 'gas' page when candidates exist,
 	 *       * seed rejected by votesDelegated — rate-limited 'seed' page, then continues seed-less if retry works
@@ -1076,8 +1102,23 @@ export class MinterGuardService {
 	private async runDenyPrecheck(
 		signerAddress: string,
 		wallet: ethers.Wallet,
-		candidates: Array<{ address: string }>
+		candidates: Array<{ address: string }>,
+		cycleStartedAt: number
 	): Promise<{ ok: boolean; helpers: string[] }> {
+		// Honour the single cycle deadline before any pre-check RPC: if remaining budget is below the
+		// useful floor there is no point starting sequential votes/gas calls we cannot finish, and the
+		// send loop would only defer anyway. Deferral is not a failure — candidates stay tracked/unmarked,
+		// no page (a missed cycle of pre-check is recovered next tick).
+		const precheckRemainingMs = this.cycleRemainingMs(cycleStartedAt);
+		if (precheckRemainingMs < DENY_CONFIRM_MIN_USEFUL_MS) {
+			this.logger.warn(
+				`MinterGuard: deny pre-check deferred (cycle deadline ${CYCLE_BUDGET_MS}ms; ` +
+					`${precheckRemainingMs}ms remaining < ${DENY_CONFIRM_MIN_USEFUL_MS}ms useful floor); ` +
+					`${candidates.length} candidate(s) left for the next cycle (not marked done, no page — deferral is not a failure).`
+			);
+			return { ok: false, helpers: [] };
+		}
+
 		try {
 			const provider = this.providerService.provider;
 			const chainId = this.config.blockchainId;
@@ -1181,11 +1222,19 @@ export class MinterGuardService {
 			}
 
 			// Precise estimate against a representative denyMinter() (cost is minter-independent to first
-			// order), only after the balance floor above rules out an "insufficient funds" revert and after
-			// the votes check rules out a NotQualified revert. This is BEST-EFFORT on top of the worst-case
-			// floor: a sample-specific revert must NOT drop every candidate this cycle (e.g. sample just
-			// crossed its own deadline). The worst-case floor already guarantees gas, and the per-candidate
-			// TooLate guard + try/catch handle each send — so on estimate failure we simply proceed.
+			// order), only after the balance floor above rules out an obvious "insufficient funds" shortfall
+			// and after the votes check rules out a NotQualified revert. The floor catches an obviously
+			// underfunded signer up front; it does NOT guarantee the true cost — the band between the
+			// permissive worst-case floor and the real estimate is what estimateGas covers next.
+			//
+			// Split on estimate failure:
+			//   * insufficient funds (code or message) → gas shortfall in that band: page and skip the cycle
+			//     (same dedicated gas page the floor-before-estimate ordering exists to guarantee). Without
+			//     this branch the catch would swallow the shortfall, the cycle would proceed, and the real
+			//     send would fail as an ordinary per-candidate error instead of the gas page.
+			//   * any other estimate revert → BEST-EFFORT: a sample-specific revert must NOT drop every
+			//     candidate this cycle (e.g. sample just crossed its own deadline). Proceed on the floor;
+			//     the per-candidate TooLate guard + try/catch handle each send.
 			try {
 				const jusd = new ethers.Contract(ADDRESS[chainId].juiceDollar, JuiceDollarABI, wallet);
 				const gasEstimate: bigint = BigInt(
@@ -1211,6 +1260,24 @@ export class MinterGuardService {
 			} catch (estimateError) {
 				const em =
 					typeof estimateError?.message === 'string' && estimateError.message ? estimateError.message : String(estimateError);
+				const isInsufficientFunds = estimateError?.code === 'INSUFFICIENT_FUNDS' || /insufficient funds/i.test(em);
+				if (isInsufficientFunds) {
+					// Narrow band between the worst-case floor and true cost: floor passed, estimate did not.
+					this.logger.warn(
+						`MinterGuard SKIP: signer ${signerAddress} low on gas ` +
+							`(balance ${ethers.formatEther(balance)} cBTC; precise estimate reported insufficient funds: ${em})`
+					);
+					await this.maybeAlertSkip(
+						'gas',
+						`⚠️ *Minter guard low on cBTC — deny skipped*\n\n` +
+							`Signer: \`${signerAddress}\`\n` +
+							`Balance: ${ethers.formatEther(balance)} cBTC\n` +
+							`Precise estimate reported insufficient funds.\n` +
+							`${candidates.length} unwhitelisted PROPOSED minter(s) left undenied.\n\n` +
+							`Fund the signer with cBTC.`
+					);
+					return { ok: false, helpers };
+				}
 				this.logger.warn(
 					`MinterGuard: sample denyMinter gas estimate on ${candidates[0].address} reverted (${em}); ` +
 						`proceeding on the worst-case gas floor — the per-candidate TooLate guard and try/catch handle each send.`
