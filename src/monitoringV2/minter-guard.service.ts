@@ -683,6 +683,9 @@ export class MinterGuardService {
 			const precheck = await this.runDenyPrecheck(signerAddress, wallet, workingSet, cycleStartedAt);
 			if (precheck.ok) {
 				const helpers = precheck.helpers;
+				// Same fee overrides the pre-check priced the balance floor / estimate against — must match the
+				// deny send so the node cannot reject as underfunded after a green pre-check.
+				const overrides = precheck.overrides;
 
 				let deferDeniesLogged = false;
 				let candidatesStarted = 0;
@@ -802,7 +805,13 @@ export class MinterGuardService {
 					let confirmed = false;
 					let txHash: string | undefined;
 					try {
-						const tx = await juiceDollar.denyMinter(address, helpers, message);
+						// Fee overrides are exactly those resolveDenyFee produced and the pre-check priced
+						// against (feePerGas / maxFeePerGas+tip or gasPrice), so a shortfall can no longer be
+						// discovered by the node after the pre-check passed. The failure this prevents: pinned
+						// ethers 6.7.1 hardcodes a 1 gwei priority fee while Citrea base fee is ~0.001 gwei, so
+						// an unchecked getFeeData path inflated the EIP-1559 reservation ~1000× and made a
+						// well-funded signer (e.g. 0.0000093 cBTC) look broke.
+						const tx = await juiceDollar.denyMinter(address, helpers, message, overrides);
 						txHash = tx.hash;
 						this.logger.warn(`Submitted denyMinter for ${address}: tx=${tx.hash}`);
 						// Bounded wait: on timeout this throws and the minter is left unmarked to retry next
@@ -813,15 +822,15 @@ export class MinterGuardService {
 						//
 						// INVARIANT: the cycle deadline governs whether a send is STARTED, not how long an
 						// in-flight transaction is awaited. Compute waitTimeoutMs HERE (after broadcast), not
-						// before denyMinter: with no gas/fee overrides that call populates the tx first (gas
-						// estimation, fee data, nonce), then signs and broadcasts — so a pre-send remaining-budget
-						// value is stale by the whole submission duration and can starve the wait. Once broadcast,
-						// the guard waits at least DENY_CONFIRM_MIN_WAIT_MS so the timeout is positive by
-						// construction and the cycle may overshoot by that floor at most. A non-positive timeout
-						// must never be submitted: ethers passes it to setTimeout, Node clamps it to ~1 ms, and
-						// tx.wait rejects almost immediately while the transaction is still in flight — burning a
-						// MAX_DENY_ATTEMPTS slot and risking a redundant fresh-nonce resend for a deny that may
-						// confirm on its own.
+						// before denyMinter: even with fee overrides from resolveDenyFee, that call still
+						// populates gas estimate and nonce, then signs and broadcasts — so a pre-send
+						// remaining-budget value is stale by the whole submission duration and can starve the
+						// wait. Once broadcast, the guard waits at least DENY_CONFIRM_MIN_WAIT_MS so the timeout
+						// is positive by construction and the cycle may overshoot by that floor at most. A
+						// non-positive timeout must never be submitted: ethers passes it to setTimeout, Node
+						// clamps it to ~1 ms, and tx.wait rejects almost immediately while the transaction is
+						// still in flight — burning a MAX_DENY_ATTEMPTS slot and risking a redundant fresh-nonce
+						// resend for a deny that may confirm on its own.
 						const waitTimeoutMs = Math.min(
 							DENY_CONFIRM_TIMEOUT_MS,
 							Math.max(this.cycleRemainingMs(cycleStartedAt), DENY_CONFIRM_MIN_WAIT_MS)
@@ -1141,8 +1150,71 @@ export class MinterGuardService {
 	}
 
 	/**
-	 * Signer-global deny pre-check, run once per cycle before any denyMinter(). Returns { ok, helpers }:
-	 *   - ok=true  => helpers are ready; proceed to per-candidate deny loop.
+	 * Resolve the per-gas fee the guard will actually put on a deny, once, so the balance check and the
+	 * send path cannot disagree on reservation size.
+	 *
+	 * WHY not provider.getFeeData() for the tip: pinned ethers 6.7.1 hardcodes maxPriorityFeePerGas to
+	 * 1 gwei whenever the latest block has a baseFeePerGas (lib.commonjs/providers/abstract-provider.js
+	 * getFeeData), then sets maxFeePerGas = 2 * baseFeePerGas + 1 gwei. On Citrea mainnet the base fee is
+	 * ~0.001 gwei (1_000_000 wei) and eth_maxPriorityFeePerGas returns ~100 wei, so ethers inflates the
+	 * EIP-1559 reservation about 1000×. With a ~208_000-gas ceiling that makes the node demand ~0.000208
+	 * cBTC reserved while the real cost is ~0.000000208 cBTC — a signer holding 0.0000093 cBTC (enough for
+	 * dozens of real denies) fails the pre-check floor and would be rejected as underfunded. This helper
+	 * asks the chain for its own priority fee and prices / sends against that number.
+	 */
+	private async resolveDenyFee(): Promise<{ feePerGas: bigint; overrides: ethers.Overrides }> {
+		const provider = this.providerService.provider;
+		const latestBlock = await provider.getBlock('latest');
+		if (!latestBlock) {
+			throw new Error("provider.getBlock('latest') returned null while resolving deny fee");
+		}
+
+		const baseFeePerGas = latestBlock.baseFeePerGas;
+		if (baseFeePerGas !== null && baseFeePerGas !== undefined) {
+			let maxPriorityFeePerGas: bigint;
+			try {
+				const result: unknown = await provider.send('eth_maxPriorityFeePerGas', []);
+				if (result === null || result === undefined || result === '') {
+					throw new Error(`eth_maxPriorityFeePerGas returned unusable value: ${String(result)}`);
+				}
+				maxPriorityFeePerGas = BigInt(result as string | number | bigint);
+			} catch (error) {
+				// Do not silently swallow: log the RPC / parse failure, then fall back with a further log.
+				const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
+				this.logger.warn(`MinterGuard: eth_maxPriorityFeePerGas failed or unusable (${errorMsg}); falling back for priority fee`);
+				const feeData = await provider.getFeeData();
+				if (feeData.maxPriorityFeePerGas !== null && feeData.maxPriorityFeePerGas !== undefined) {
+					maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+					this.logger.warn(
+						`MinterGuard: using getFeeData().maxPriorityFeePerGas=${maxPriorityFeePerGas.toString()} after eth_maxPriorityFeePerGas failure`
+					);
+				} else {
+					// Zero tip can leave the transaction unmined on a busy chain — warn, do not hide.
+					maxPriorityFeePerGas = 0n;
+					this.logger.warn(
+						'MinterGuard: falling back to maxPriorityFeePerGas=0 after eth_maxPriorityFeePerGas failure and no getFeeData tip; ' +
+							'a zero tip can leave the deny unmined on a busy chain'
+					);
+				}
+			}
+			const maxFeePerGas = baseFeePerGas * 2n + maxPriorityFeePerGas;
+			return { feePerGas: maxFeePerGas, overrides: { maxFeePerGas, maxPriorityFeePerGas } };
+		}
+
+		// Non-EIP-1559 chain: price and send with legacy gasPrice only.
+		const feeData = await provider.getFeeData();
+		const gasPrice = feeData.gasPrice;
+		if (gasPrice === null || gasPrice === undefined) {
+			throw new Error('feeData has neither maxFeePerGas nor gasPrice');
+		}
+		return { feePerGas: gasPrice, overrides: { gasPrice } };
+	}
+
+	/**
+	 * Signer-global deny pre-check, run once per cycle before any denyMinter(). Returns
+	 * { ok, helpers, overrides? }:
+	 *   - ok=true  => helpers and fee overrides are ready; proceed to per-candidate deny loop (send must
+	 *     use the same overrides the balance floor / estimate priced against).
 	 *   - ok=false => SKIP all denies this cycle. Paths that produce ok=false:
 	 *       * cycle budget already below DENY_CONFIRM_MIN_USEFUL_MS at entry — defer (warn, no page),
 	 *       * cycle deadline exhausted between sequential pre-check chain calls — defer (warn, no page),
@@ -1160,7 +1232,7 @@ export class MinterGuardService {
 		wallet: ethers.Wallet,
 		candidates: Array<{ address: string }>,
 		cycleStartedAt: number
-	): Promise<{ ok: boolean; helpers: string[] }> {
+	): Promise<{ ok: true; helpers: string[]; overrides: ethers.Overrides } | { ok: false; helpers: string[] }> {
 		// Honour the single cycle deadline before any pre-check RPC: if remaining budget is below the
 		// useful floor there is no point starting sequential votes/gas calls we cannot finish, and the
 		// send loop would only defer anyway. Deferral is not a failure — candidates stay tracked/unmarked,
@@ -1286,14 +1358,14 @@ export class MinterGuardService {
 			if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
 				this.logger.warn(
 					`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
-						`getFeeData() not reached — deferring ${candidates.length} candidate(s) to the next cycle ` +
+						`resolveDenyFee() not reached — deferring ${candidates.length} candidate(s) to the next cycle ` +
 						`(not marked done, no page — deferral is not a failure).`
 				);
 				return { ok: false, helpers };
 			}
-			const feeData = await provider.getFeeData();
-			const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice;
-			if (gasPrice === null || gasPrice === undefined) throw new Error('feeData has neither maxFeePerGas nor gasPrice');
+			// Single fee resolution for both the arithmetic below and the send-path overrides: check and
+			// transaction must never disagree (see resolveDenyFee — ethers getFeeData 1 gwei tip inflation).
+			const { feePerGas, overrides } = await this.resolveDenyFee();
 			if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
 				this.logger.warn(
 					`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
@@ -1310,8 +1382,9 @@ export class MinterGuardService {
 			// balance against a helper-count-aware worst-case ceiling (denyGasCeiling * fee) up front
 			// guarantees a gas shortfall ALWAYS pages, before estimateGas is ever attempted. helpers.length
 			// is the post seed-drop-retry set. Native unit on Citrea is cBTC (18 decimals —
-			// ethers.formatEther is still correct).
-			const worstCaseCost = denyGasCeiling(helpers.length) * gasPrice;
+			// ethers.formatEther is still correct). feePerGas is the same value the send will use (not
+			// ethers' inflated getFeeData maxFeePerGas).
+			const worstCaseCost = denyGasCeiling(helpers.length) * feePerGas;
 			if (balance < worstCaseCost) {
 				this.logger.warn(
 					`MinterGuard SKIP: signer ${signerAddress} low on gas ` +
@@ -1356,7 +1429,7 @@ export class MinterGuardService {
 				const gasEstimate: bigint = BigInt(
 					await jusd.denyMinter.estimateGas(candidates[0].address, helpers, 'minter-guard gas estimate')
 				);
-				const estimatedCost = gasEstimate * gasPrice;
+				const estimatedCost = gasEstimate * feePerGas;
 				if (balance < estimatedCost) {
 					this.logger.warn(
 						`MinterGuard SKIP: signer ${signerAddress} low on gas ` +
@@ -1400,7 +1473,7 @@ export class MinterGuardService {
 				);
 			}
 
-			return { ok: true, helpers };
+			return { ok: true, helpers, overrides };
 		} catch (error) {
 			// Unusable pre-check (RPC failure, or votesDelegated still failing with no usable seed-less set):
 			// skip this cycle (logged, not silently swallowed). When candidates exist, also page under the
@@ -1627,12 +1700,13 @@ export class MinterGuardService {
 
 		const qual = await this.evaluateQualification();
 
-		// Gas status: model denyMinter() cost with the helper-count-aware ceiling * live fee.
+		// Gas status: model denyMinter() cost with the helper-count-aware ceiling * the same fee the
+		// guard would actually pay on send (resolveDenyFee — not ethers getFeeData, which hardcodes a
+		// 1 gwei tip and inflates cheap-chain reservations ~1000×; see resolveDenyFee). Fail-loud: a
+		// fee-read failure throws (5xx) rather than reporting a fabricated gasEnough / estimatedDenyCost.
 		const balance: bigint = await provider.getBalance(signerAddress);
-		const feeData = await provider.getFeeData();
-		const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice;
-		if (gasPrice === null || gasPrice === undefined) throw new Error('feeData has neither maxFeePerGas nor gasPrice');
-		const estimatedDenyCost = denyGasCeiling(qual.helperCount) * gasPrice;
+		const { feePerGas } = await this.resolveDenyFee();
+		const estimatedDenyCost = denyGasCeiling(qual.helperCount) * feePerGas;
 
 		return {
 			enabled: true,
