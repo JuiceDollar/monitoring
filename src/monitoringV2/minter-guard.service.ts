@@ -15,15 +15,19 @@ import { GuardResponse } from '../../shared/types';
 // unbounded tx.wait() would block processBlocks, leaving isRunning=true so no later cycle (and none of
 // the sibling alert watchers) ever runs, and — because nothing throws — no stuck-alert fires. Must be
 // shorter than the EVERY_5_MINUTES cron. On timeout the throw is caught, the minter is NOT marked done,
-// and it retries next cycle within the attempt cap.
+// and it retries next cycle within the attempt cap. Per-tx wait is further capped by cycleRemainingMs.
 const DENY_CONFIRM_TIMEOUT_MS = 180_000;
 
-// Per-cycle budget for sequential tx.wait confirmations across all candidates. Must stay below the
-// EVERY_5_MINUTES (300s) cadence so later watchers in the same cycle are not delayed and the next
-// tick does not skip on isRunning. Invariant: total confirmation wait per cycle stays under this budget.
-const DENY_CYCLE_CONFIRM_BUDGET_MS = 240_000;
+// Comfortably below the EVERY_5_MINUTES cadence; the whole guard cycle must fit inside it, because
+// monitoring.service guards the cycle with one isRunning flag and an overrun costs the next tick.
+// Single deadline for resolve pass, send-loop JIT reads + confirms, sweep, and pending-alert retries —
+// replaces the earlier separate RPC_PASS_BUDGET_MS / DENY_CYCLE_CONFIRM_BUDGET_MS budgets (and the
+// confirmBudgetSpentMs accumulator). Three separate meters could not express the cycle-wide invariant,
+// and the per-candidate JIT reads in the send loop had no budget at all; worst case summed well past
+// the cadence while veto windows kept moving.
+const CYCLE_BUDGET_MS = 240_000;
 
-// Floor: if remaining confirmation budget is below this, defer remaining candidates to the next cycle
+// Floor: if remaining cycle budget is below this, defer remaining candidates to the next cycle
 // rather than starting a deny whose confirmation cannot complete usefully within the cadence.
 // A deferral is not a failure — do not mark done and do not page.
 const DENY_CONFIRM_MIN_USEFUL_MS = 30_000;
@@ -34,17 +38,20 @@ const DENY_CONFIRM_MIN_USEFUL_MS = 30_000;
 const SKIP_ALERT_COOLDOWN_MS = 60 * 60 * 1000;
 
 // Helper-count-aware denyMinter() gas ceiling for the balance floor (pre-check) and the read-only
-// /guard status display (gasEnough / estimated cost). Deliberately generous upper bounds whose only
-// job is to make a gas shortfall page BEFORE a doomed send; the precise estimateGas call remains the
-// accurate check. Equity.votesDelegated loops over helpers (votes + recursive _canVoteFor per entry),
-// so a fixed ceiling under-prices large helper lists and can let the balance check pass while the
-// transaction still runs out of gas.
+// /guard status display (gasEnough / estimated cost). Deliberately rough upper bound whose ONLY job
+// is to make an obviously underfunded signer page before a doomed send; the precise estimateGas call
+// immediately afterwards is the accurate check — so the floor is intentionally permissive rather than
+// protective. A too-high per-helper term with a large helper set invented a shortfall that did not
+// exist and vetoed every candidate for the cycle (worse than the out-of-gas risk the ceiling covers).
+// DENY_GAS_CEILING_MAX caps inflation so a large helper set cannot push the floor without bound.
 const DENY_GAS_BASE = 200_000n;
-const DENY_GAS_PER_HELPER = 30_000n;
+const DENY_GAS_PER_HELPER = 8_000n;
+const DENY_GAS_CEILING_MAX = 1_000_000n;
 
 /** Worst-case gas ceiling for denyMinter given the helper list length (see DENY_GAS_* constants). */
 function denyGasCeiling(helperCount: number): bigint {
-	return DENY_GAS_BASE + BigInt(helperCount) * DENY_GAS_PER_HELPER;
+	const uncapped = DENY_GAS_BASE + BigInt(helperCount) * DENY_GAS_PER_HELPER;
+	return uncapped > DENY_GAS_CEILING_MAX ? DENY_GAS_CEILING_MAX : uncapped;
 }
 
 // Safety buffer (seconds) for the just-in-time TooLate pre-check: a minter whose live block timestamp is
@@ -68,12 +75,6 @@ const MAX_RESOLVE_READS_PER_CYCLE = 25;
 // Cap serial minters() reads in the passing-unchallenged sweep for the same cadence reason. Paired with
 // round-robin resume so a fixed start cannot starve the same tail forever under the cap.
 const MAX_SWEEP_READS_PER_CYCLE = 25;
-
-// Wall-clock budget for each serial RPC pass (resolve + sweep). A call-count cap alone does not bound
-// duration: the provider's configured RPC timeout is 60s, so 25 sequential timing-out reads take
-// ~25 minutes — the cycle overruns its 5-minute cadence, isRunning suppresses later ticks, and every
-// later watcher is delayed while veto windows keep progressing. Each pass gets its own budget of this size.
-const RPC_PASS_BUDGET_MS = 60_000;
 
 // Short backoff after a FAILED skip-page delivery. Full SKIP_ALERT_COOLDOWN_MS still applies on success
 // (and when alerts are disabled). Trade-off: a delivered page must not repeat for an hour; a failed one
@@ -146,11 +147,14 @@ export class MinterGuardService {
 		deadline: 0,
 		invariant: 0,
 	};
-	// Last undelivered skip page per kind. Terminal pages already use denyState.pendingAlert; skip pages
-	// must be retained the same way so a page is not lost when the condition stops recurring (e.g. the
-	// candidate became APPROVED, the RPC recovered). Retried in retryPendingAlerts under the shared
-	// MAX_ALERT_RETRIES_PER_CYCLE budget; cleared only on confirmed delivery.
-	private readonly pendingSkipAlerts = new Map<SkipAlertKind, string>();
+	// Last undelivered skip page, keyed by page (kind alone for cycle-global pages; `${kind}:${dedupKey}`
+	// for per-candidate pages such as deadline). COOLDOWN stays per kind — it limits how often a CLASS of
+	// page fires; only retention and retry bookkeeping are per page, so a delivered page for minter B
+	// cannot destroy an undelivered page for minter A of the same kind. Terminal pages already use
+	// denyState.pendingAlert; skip pages must be retained the same way so a page is not lost when the
+	// condition stops recurring. Retried in retryPendingAlerts under the shared MAX_ALERT_RETRIES_PER_CYCLE
+	// budget; cleared only on confirmed delivery.
+	private readonly pendingSkipAlerts = new Map<string, string>();
 	// Round-robin resume for the capped sweep: address last examined when the read cap stopped the pass.
 	// Next cycle starts AFTER this key so entries beyond MAX_SWEEP_READS_PER_CYCLE are not starved forever
 	// under a fixed Map iteration start.
@@ -397,7 +401,7 @@ export class MinterGuardService {
 	 * next cycle starts with pages not tried recently. Without rotation, five permanently failing entries at
 	 * the front of the map would starve every later pending page indefinitely under the per-cycle cap.
 	 */
-	private async retryPendingAlerts(): Promise<void> {
+	private async retryPendingAlerts(cycleStartedAt: number): Promise<void> {
 		const pending: Array<[string, DenyStateEntry]> = [];
 		for (const [addrLc, state] of this.denyState) {
 			if (state.pendingAlert && state.alerted !== true) {
@@ -405,12 +409,26 @@ export class MinterGuardService {
 			}
 		}
 		// Snapshot skip entries so iteration is stable while the map may clear on success.
-		const pendingSkips: Array<[SkipAlertKind, string]> = [...this.pendingSkipAlerts.entries()];
+		// Keys are page-level (kind or kind:dedupKey); see pendingSkipAlerts.
+		const pendingSkips: Array<[string, string]> = [...this.pendingSkipAlerts.entries()];
 		const totalPendingAtStart = pending.length + pendingSkips.length;
 
 		let attempted = 0;
 		let capWarned = false;
+		let deadlineWarned = false;
 		for (const [addrLc, state] of pending) {
+			// Respect the single cycle deadline so a Telegram backlog cannot overrun the cadence.
+			if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+				if (!deadlineWarned) {
+					const stillPending = totalPendingAtStart - attempted;
+					this.logger.warn(
+						`MinterGuard: alert retry stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+							`${stillPending} pending page(s) still waiting for the next cycle`
+					);
+					deadlineWarned = true;
+				}
+				break;
+			}
 			if (attempted >= MAX_ALERT_RETRIES_PER_CYCLE) {
 				const stillPending = totalPendingAtStart - attempted;
 				this.logger.warn(
@@ -433,7 +451,18 @@ export class MinterGuardService {
 		}
 
 		// Retry undelivered skip pages under the same per-cycle cap (not a separate budget).
-		for (const [kind, message] of pendingSkips) {
+		for (const [retentionKey, message] of pendingSkips) {
+			if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+				if (!deadlineWarned) {
+					const stillPending = totalPendingAtStart - attempted;
+					this.logger.warn(
+						`MinterGuard: alert retry stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+							`${stillPending} pending page(s) still waiting for the next cycle`
+					);
+					deadlineWarned = true;
+				}
+				break;
+			}
 			if (attempted >= MAX_ALERT_RETRIES_PER_CYCLE) {
 				if (!capWarned) {
 					const stillPending = totalPendingAtStart - attempted;
@@ -445,14 +474,18 @@ export class MinterGuardService {
 				}
 				break;
 			}
-			// May have been cleared if maybeAlertSkip delivered the same kind later in this cycle.
-			if (!this.pendingSkipAlerts.has(kind)) continue;
+			// May have been cleared if maybeAlertSkip delivered the same page later in this cycle.
+			if (!this.pendingSkipAlerts.has(retentionKey)) continue;
+
+			// Kind prefix of the retention key (cooldown is per kind, not per page — see maybeAlertSkip).
+			const colon = retentionKey.indexOf(':');
+			const kind = (colon === -1 ? retentionKey : retentionKey.slice(0, colon)) as SkipAlertKind;
 
 			// Re-truncate in case an older retained body predates the helper move; never re-send oversize text.
 			const body = truncateAlertBody(message);
 			if (!this.telegramService.alertsEnabled) {
 				// Nothing to deliver to — drop retention (same durable record as maybeAlertSkip when disabled).
-				this.pendingSkipAlerts.delete(kind);
+				this.pendingSkipAlerts.delete(retentionKey);
 				this.lastSkipAlertAt[kind] = Date.now();
 				this.logger.error(`MinterGuard skip page not deliverable on retry (telegram disabled; not retained): ${body}`);
 				attempted++;
@@ -462,14 +495,14 @@ export class MinterGuardService {
 			const delivered = await this.telegramService.sendCriticalAlert(body);
 			attempted++;
 			if (delivered) {
-				this.pendingSkipAlerts.delete(kind);
+				this.pendingSkipAlerts.delete(retentionKey);
 				// Confirmed delivery: arm full cooldown so the same kind does not re-page for an hour.
 				this.lastSkipAlertAt[kind] = Date.now();
 			} else {
 				// Keep retained body for the next cycle; short backoff so maybeAlertSkip path stays bounded too.
-				this.pendingSkipAlerts.set(kind, body);
+				this.pendingSkipAlerts.set(retentionKey, body);
 				this.lastSkipAlertAt[kind] = Date.now() - SKIP_ALERT_COOLDOWN_MS + SKIP_ALERT_RETRY_BACKOFF_MS;
-				this.logger.error(`MinterGuard skip page retry failed delivery (kind=${kind}); retained for next cycle: ${body}`);
+				this.logger.error(`MinterGuard skip page retry failed delivery (key=${retentionKey}); retained for next cycle: ${body}`);
 			}
 		}
 
@@ -502,6 +535,10 @@ export class MinterGuardService {
 	async checkAndDeny(): Promise<void> {
 		const { signerKey, signerAddress, jusdAddress } = this;
 		if (!this.enabled || !signerKey || !signerAddress || !jusdAddress || !this.denyErrorInterface) return;
+
+		// Single cycle deadline: every RPC-bearing pass and per-tx wait derives stop/timeout from this
+		// (see CYCLE_BUDGET_MS / cycleRemainingMs). Captured once at the start of the guard work.
+		const cycleStartedAt = Date.now();
 
 		const minters = await this.minterRepo.findAll();
 		// Denies BRIDGE-typed proposals too: bridge type is inferred from a single
@@ -555,16 +592,15 @@ export class MinterGuardService {
 			let resolveReads = 0;
 			let resolveTruncated = false;
 			let resolveStopReason: 'count' | 'time' | undefined;
-			const resolveStartedAt = Date.now();
 			for (const minter of candidatesOrdered) {
-				// Cap serial RPC by count AND wall-clock so this pass cannot outgrow the 5-minute cadence
-				// (see MAX_RESOLVE_READS_PER_CYCLE and RPC_PASS_BUDGET_MS).
+				// Cap serial RPC by count AND the single cycle deadline so this pass cannot outgrow the
+				// 5-minute cadence (see MAX_RESOLVE_READS_PER_CYCLE and CYCLE_BUDGET_MS).
 				if (resolveReads >= MAX_RESOLVE_READS_PER_CYCLE) {
 					resolveTruncated = true;
 					resolveStopReason = 'count';
 					break;
 				}
-				if (Date.now() - resolveStartedAt >= RPC_PASS_BUDGET_MS) {
+				if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
 					resolveTruncated = true;
 					resolveStopReason = 'time';
 					break;
@@ -578,6 +614,8 @@ export class MinterGuardService {
 				} catch (error) {
 					// Sustained RPC fault must not let a veto window expire in silence — rate-limited page.
 					// Candidate is already registered above; drop from workingSet for this cycle only.
+					// Pass address as dedupKey so a retained deadline page for one minter cannot be destroyed
+					// when a later same-kind page for a different minter is delivered or retained.
 					const errorMsg = typeof error?.message === 'string' && error.message ? error.message : String(error);
 					this.logger.error(`MinterGuard skip ${address}: failed to read on-chain deny deadline (minters): ${errorMsg}`);
 					await this.maybeAlertSkip(
@@ -586,7 +624,8 @@ export class MinterGuardService {
 							`Address: \`${address}\`\n` +
 							`Detail: ${escapeMarkdownText(errorMsg)}\n\n` +
 							`The on-chain application deadline could not be read this cycle; the candidate is deferred ` +
-							`(not marked done). Investigate RPC if this persists — a silent window expiry must not happen.`
+							`(not marked done). Investigate RPC if this persists — a silent window expiry must not happen.`,
+						address
 					);
 					// Drop for this cycle only — do not mark done.
 					continue;
@@ -603,14 +642,14 @@ export class MinterGuardService {
 					continue;
 				}
 				// Already registered before any RPC (see loop above). Entry is present for the sweep even if
-				// this candidate later hits a continue path (confirmation-budget deferral, getBlock failure).
+				// this candidate later hits a continue path (cycle-budget deferral, getBlock failure).
 				workingSet.push({ address, onChainDeadline });
 			}
 			if (resolveTruncated) {
 				const notExamined = candidatesOrdered.length - resolveReads;
 				const limitDesc =
 					resolveStopReason === 'time'
-						? `wall-clock budget ${RPC_PASS_BUDGET_MS}ms`
+						? `cycle deadline ${CYCLE_BUDGET_MS}ms`
 						: `count cap ${MAX_RESOLVE_READS_PER_CYCLE} minters() reads`;
 				this.logger.warn(
 					`MinterGuard: resolve pass stopped (${limitDesc}); ` +
@@ -621,7 +660,7 @@ export class MinterGuardService {
 
 		// Nothing actionable: skip pre-check (would page "N left undenied" about minters that need nothing).
 		if (workingSet.length > 0) {
-			// Urgency, not database order, must decide when the confirmation budget runs short: serve the
+			// Urgency, not database order, must decide when the cycle budget runs short: serve the
 			// soonest veto window first.
 			workingSet.sort((a, b) => (a.onChainDeadline < b.onChainDeadline ? -1 : a.onChainDeadline > b.onChainDeadline ? 1 : 0));
 
@@ -631,12 +670,31 @@ export class MinterGuardService {
 			if (precheck.ok) {
 				const helpers = precheck.helpers;
 
-				// Track confirmation wait spent this cycle so sequential timeouts cannot overrun the cron cadence.
-				let confirmBudgetSpentMs = 0;
 				let deferDeniesLogged = false;
 
 				for (const { address, onChainDeadline: resolveDeadline } of workingSet) {
 					const addrLc = address.toLowerCase();
+
+					// Remaining cycle budget too small to be useful: defer new denies (not fail) so the sweep
+					// and pending-alert retry still run and the next cycle can finish the rest. Do not mark
+					// done; do not page. Checked BEFORE the JIT getBlock/minters reads so those previously
+					// unbounded-per-candidate RPCs cannot overrun the cycle deadline (the failure the single
+					// CYCLE_BUDGET_MS deadline exists to prevent).
+					// Entry was registered BEFORE the resolve pass (RPC-free bookkeeping at the start of
+					// checkAndDeny) so a resolve-pass failure or timeout cannot leave a candidate untracked —
+					// the sweep still sees this deferred minter.
+					const remainingBudgetMs = this.cycleRemainingMs(cycleStartedAt);
+					if (remainingBudgetMs < DENY_CONFIRM_MIN_USEFUL_MS) {
+						if (!deferDeniesLogged) {
+							this.logger.warn(
+								`MinterGuard: cycle budget exhausted (${CYCLE_BUDGET_MS - remainingBudgetMs}ms spent of ` +
+									`${CYCLE_BUDGET_MS}ms); deferring remaining deny candidate(s) including ${address} ` +
+									`to the next cycle (not marked done, no page — deferral is not a failure).`
+							);
+							deferDeniesLogged = true;
+						}
+						continue;
+					}
 
 					// Just-in-time TooLate / already-resolved guard. denyMinter reverts TooLate once
 					// block.timestamp > minters[_minter]. Re-read BOTH the live block timestamp and the
@@ -693,44 +751,23 @@ export class MinterGuardService {
 						continue;
 					}
 
-					// Remaining confirmation budget too small to be useful: defer new denies (not fail) so later
-					// watchers still run and the next cycle can finish the rest. Do not mark done; do not page.
-					// JIT closed-window / already-resolved paths above still run for every candidate.
-					// Entry was registered in the resolve pass so the sweep still sees this deferred minter.
-					const remainingBudgetMs = DENY_CYCLE_CONFIRM_BUDGET_MS - confirmBudgetSpentMs;
-					if (remainingBudgetMs < DENY_CONFIRM_MIN_USEFUL_MS) {
-						if (!deferDeniesLogged) {
-							this.logger.warn(
-								`MinterGuard: confirmation budget exhausted (${confirmBudgetSpentMs}ms spent of ` +
-									`${DENY_CYCLE_CONFIRM_BUDGET_MS}ms); deferring remaining deny candidate(s) including ${address} ` +
-									`to the next cycle (not marked done, no page — deferral is not a failure).`
-							);
-							deferDeniesLogged = true;
-						}
-						continue;
-					}
-
 					const envLabel = `${this.config.environment ?? 'unknown'}/${this.config.chain ?? 'unknown'}`;
 					const message = `Auto-deny by minter-guard: not in whitelist (${envLabel})`;
 					let confirmed = false;
 					let txHash: string | undefined;
-					const waitTimeoutMs = Math.min(DENY_CONFIRM_TIMEOUT_MS, remainingBudgetMs);
+					// Per-tx wait capped by whatever is left of the cycle deadline, so a slow confirmation
+					// cannot push the cycle past the cadence.
+					const waitTimeoutMs = Math.min(DENY_CONFIRM_TIMEOUT_MS, this.cycleRemainingMs(cycleStartedAt));
 					try {
 						const tx = await juiceDollar.denyMinter(address, helpers, message);
 						txHash = tx.hash;
 						this.logger.warn(`Submitted denyMinter for ${address}: tx=${tx.hash}`);
-						// Bounded wait within the per-cycle confirmation budget: on timeout this throws and the
-						// minter is left unmarked to retry next cycle. A retry sends a fresh-nonce tx (it does not
+						// Bounded wait within the cycle deadline: on timeout this throws and the minter is
+						// left unmarked to retry next cycle. A retry sends a fresh-nonce tx (it does not
 						// replace a stuck one); under sustained mempool/gas pathology the deny may not land, but the
 						// terminal FAILED alert then pages a human — an accepted limitation of the opt-in guard,
 						// deliberately not carrying nonce/replacement state.
-						const waitStartedAt = Date.now();
-						let receipt: ethers.ContractTransactionReceipt | null;
-						try {
-							receipt = await tx.wait(1, waitTimeoutMs);
-						} finally {
-							confirmBudgetSpentMs += Date.now() - waitStartedAt;
-						}
+						const receipt: ethers.ContractTransactionReceipt | null = await tx.wait(1, waitTimeoutMs);
 						if (!receipt) {
 							// wait resolved without a receipt (should be rare with confirms=1); treat as unconfirmed for retry.
 							throw new Error(`denyMinter tx.wait returned null for ${address} (tx=${txHash})`);
@@ -837,10 +874,12 @@ export class MinterGuardService {
 		}
 
 		// Sweep tracked minters that left the PROPOSED candidate set without a deny (see method).
-		await this.sweepPassedUnchallenged(juiceDollar, candidateAddressSet);
+		// Still runs after a send-loop deferral (cheap, prevents silent pass-through) but respects the deadline.
+		await this.sweepPassedUnchallenged(juiceDollar, candidateAddressSet, cycleStartedAt);
 
 		// Pending terminal pages after deny work — notifications are not time-critical; a veto window is.
-		await this.retryPendingAlerts();
+		// Still runs after a deferral; also respects the cycle deadline.
+		await this.retryPendingAlerts(cycleStartedAt);
 
 		// INVARIANT: every address OBSERVED this cycle (candidateAddressSet, built from the PROPOSED /
 		// non-whitelisted / not-yet-done query above) must hold a denyState entry by now — "observation
@@ -877,12 +916,17 @@ export class MinterGuardService {
 	 * those previously tracked addresses without widening the candidate query to APPROVED (which would
 	 * page once for every legitimately approved unwhitelisted minter on first run).
 	 *
-	 * Read count is capped (MAX_SWEEP_READS_PER_CYCLE) and wall-clock is capped (RPC_PASS_BUDGET_MS) so
-	 * serial minters() calls cannot stretch a cycle past the 5-minute cadence — a count cap alone does
-	 * not stop sequential RPC timeouts from overrunning. Resume is round-robin via sweepResumeAfter:
-	 * with a fixed start, entries beyond the cap would never be examined again.
+	 * Read count is capped (MAX_SWEEP_READS_PER_CYCLE) and wall-clock is the single cycle deadline
+	 * (CYCLE_BUDGET_MS via cycleRemainingMs) so serial minters() calls cannot stretch a cycle past the
+	 * 5-minute cadence — a count cap alone does not stop sequential RPC timeouts from overrunning.
+	 * Resume is round-robin via sweepResumeAfter: with a fixed start, entries beyond the cap would never
+	 * be examined again.
 	 */
-	private async sweepPassedUnchallenged(juiceDollar: ethers.Contract, candidateAddresses: Set<string>): Promise<void> {
+	private async sweepPassedUnchallenged(
+		juiceDollar: ethers.Contract,
+		candidateAddresses: Set<string>,
+		cycleStartedAt: number
+	): Promise<void> {
 		let latestBlock: ethers.Block | null = null;
 		try {
 			latestBlock = await this.providerService.provider.getBlock('latest');
@@ -915,9 +959,8 @@ export class MinterGuardService {
 		let lastExamined: string | undefined;
 		let truncated = false;
 		let sweepStopReason: 'count' | 'time' | undefined;
-		const sweepStartedAt = Date.now();
 		// Eligible keys we walked past without a minters() read (done / still-candidate) do not count
-		// toward the read cap; only actual RPC reads do. Wall-clock budget is checked at the same point.
+		// toward the read cap; only actual RPC reads do. Cycle deadline is checked at the same point.
 		for (let i = 0; i < keys.length; i++) {
 			const addrLc = keys[(startIdx + i) % keys.length];
 			const state = this.denyState.get(addrLc);
@@ -931,7 +974,7 @@ export class MinterGuardService {
 				sweepStopReason = 'count';
 				break;
 			}
-			if (Date.now() - sweepStartedAt >= RPC_PASS_BUDGET_MS) {
+			if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
 				truncated = true;
 				sweepStopReason = 'time';
 				break;
@@ -1008,7 +1051,7 @@ export class MinterGuardService {
 			}
 			const limitDesc =
 				sweepStopReason === 'time'
-					? `wall-clock budget ${RPC_PASS_BUDGET_MS}ms`
+					? `cycle deadline ${CYCLE_BUDGET_MS}ms`
 					: `count cap ${MAX_SWEEP_READS_PER_CYCLE} minters() reads`;
 			this.logger.warn(
 				`MinterGuard: sweep stopped (${limitDesc}); ` +
@@ -1202,19 +1245,28 @@ export class MinterGuardService {
 	 * Rate-limited skip page: at most one per kind per SKIP_ALERT_COOLDOWN_MS (in-memory, reset on restart).
 	 * Kinds have independent timers so one class of page cannot suppress another.
 	 *
+	 * COOLDOWN stays per kind — it limits how often a CLASS of page fires. Retention and retry are per
+	 * page: optional dedupKey keys pendingSkipAlerts as `${kind}:${dedupKey}` so a per-candidate page
+	 * (e.g. deadline for minter A) is not overwritten or deleted when a later same-kind page for a
+	 * different minter is retained or delivered. Cycle-global pages (votes, gas, seed, precheck,
+	 * invariant) omit dedupKey and stay keyed by kind alone. Do not conflate the two bookkeeping axes.
+	 *
 	 * Cooldown arming:
 	 *   - SUCCESS (or telegram disabled): stamp full SKIP_ALERT_COOLDOWN_MS — a delivered page must not
-	 *     be repeated for an hour. Clear any retained undelivered body for this kind.
+	 *     be repeated for an hour. Clear any retained undelivered body for this page key.
 	 *   - FAILED delivery: stamp a short SKIP_ALERT_RETRY_BACKOFF_MS window AND retain the truncated body
 	 *     in pendingSkipAlerts so retryPendingAlerts can re-send even if the condition does not recur
 	 *     (candidate became APPROVED, RPC recovered). A page describing a condition that no longer holds
 	 *     is still worth delivering: it tells the operator what happened while they could not be reached.
 	 * Trade-off explicit: delivered → quiet for an hour; failed → bounded retry + retention; never a per-cycle loop.
 	 */
-	private async maybeAlertSkip(kind: SkipAlertKind, message: string): Promise<void> {
+	private async maybeAlertSkip(kind: SkipAlertKind, message: string, dedupKey?: string): Promise<void> {
 		const nowMs = Date.now();
 		const lastAt = this.lastSkipAlertAt[kind];
 		if (nowMs - lastAt < SKIP_ALERT_COOLDOWN_MS) return;
+
+		// Retention key is per page; cooldown above is still per kind (see method comment).
+		const retentionKey = dedupKey ? `${kind}:${dedupKey}` : kind;
 
 		// Truncate every skip-page body too — not just terminal pages (see truncateAlertBody).
 		const body = truncateAlertBody(message);
@@ -1222,7 +1274,7 @@ export class MinterGuardService {
 		// Telegram disabled: nothing to deliver to — stamp full cooldown so we do not re-log every cycle.
 		if (!this.telegramService.alertsEnabled) {
 			this.lastSkipAlertAt[kind] = nowMs;
-			this.pendingSkipAlerts.delete(kind);
+			this.pendingSkipAlerts.delete(retentionKey);
 			this.logger.error(`MinterGuard skip page not deliverable (telegram disabled): ${body}`);
 			return;
 		}
@@ -1230,18 +1282,27 @@ export class MinterGuardService {
 		const delivered = await this.telegramService.sendCriticalAlert(body);
 		if (delivered) {
 			this.lastSkipAlertAt[kind] = nowMs;
-			this.pendingSkipAlerts.delete(kind);
+			this.pendingSkipAlerts.delete(retentionKey);
 		} else {
 			// Short backoff only: next attempt after SKIP_ALERT_RETRY_BACKOFF_MS (see method comment).
 			// lastAt is stored such that (now - lastAt) reaches SKIP_ALERT_COOLDOWN_MS after the backoff.
 			// Retain the truncated body so the page is not lost when the condition stops recurring.
 			this.lastSkipAlertAt[kind] = nowMs - SKIP_ALERT_COOLDOWN_MS + SKIP_ALERT_RETRY_BACKOFF_MS;
-			this.pendingSkipAlerts.set(kind, body);
+			this.pendingSkipAlerts.set(retentionKey, body);
 			this.logger.error(
-				`MinterGuard skip page failed delivery (kind=${kind}); retained and will retry after ` +
+				`MinterGuard skip page failed delivery (key=${retentionKey}); retained and will retry after ` +
 					`${SKIP_ALERT_RETRY_BACKOFF_MS}ms backoff: ${body}`
 			);
 		}
+	}
+
+	/**
+	 * Remaining wall-clock budget for the current guard cycle (see CYCLE_BUDGET_MS). Every RPC-bearing
+	 * pass, the send-loop stop condition, and each per-tx wait timeout derive from this single deadline
+	 * so an overrun cannot leave isRunning stuck across the next EVERY_5_MINUTES tick.
+	 */
+	private cycleRemainingMs(cycleStartedAt: number): number {
+		return CYCLE_BUDGET_MS - (Date.now() - cycleStartedAt);
 	}
 
 	/**
