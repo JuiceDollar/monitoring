@@ -32,6 +32,13 @@ const CYCLE_BUDGET_MS = 240_000;
 // A deferral is not a failure — do not mark done and do not page.
 const DENY_CONFIRM_MIN_USEFUL_MS = 30_000;
 
+// Minimum wait the guard owes a deny transaction it has already broadcast. The cycle deadline
+// governs whether a send is STARTED; once the tx is in flight, the confirmation wait must not be
+// abandoned instantly (or starved to near-zero by submission latency) — that would burn an attempt
+// and risk a redundant fresh-nonce resend for a deny that may confirm on its own. Distinct from
+// DENY_CONFIRM_MIN_USEFUL_MS (pre-send start gate).
+const DENY_CONFIRM_MIN_WAIT_MS = 30_000;
+
 // Cooldown between repeated skip pages (in-memory only, reset on restart). Independent timers per kind
 // so no page class may suppress another (e.g. a reassuring seed-drop page must never swallow the critical
 // under-quorum page, and a precheck failure must not share a timer with votes/gas/seed).
@@ -794,23 +801,31 @@ export class MinterGuardService {
 					const message = `Auto-deny by minter-guard: not in whitelist (${envLabel})`;
 					let confirmed = false;
 					let txHash: string | undefined;
-					// Per-tx wait capped by whatever is left of the cycle deadline, so a slow confirmation
-					// cannot push the cycle past the cadence.
-					// INVARIANT: the send-budget gate above guarantees remainingBudgetMs >= DENY_CONFIRM_MIN_USEFUL_MS
-					// at this point, so waitTimeoutMs is always positive. A non-positive timeout must never be
-					// submitted: ethers passes it to setTimeout, Node clamps it to ~1 ms, tx.wait rejects almost
-					// immediately after the tx is already in-flight — burning a MAX_DENY_ATTEMPTS slot and risking
-					// a redundant fresh-nonce resend for a deny that may confirm on its own.
-					const waitTimeoutMs = Math.min(DENY_CONFIRM_TIMEOUT_MS, this.cycleRemainingMs(cycleStartedAt));
 					try {
 						const tx = await juiceDollar.denyMinter(address, helpers, message);
 						txHash = tx.hash;
 						this.logger.warn(`Submitted denyMinter for ${address}: tx=${tx.hash}`);
-						// Bounded wait within the cycle deadline: on timeout this throws and the minter is
-						// left unmarked to retry next cycle. A retry sends a fresh-nonce tx (it does not
-						// replace a stuck one); under sustained mempool/gas pathology the deny may not land, but the
-						// terminal FAILED alert then pages a human — an accepted limitation of the opt-in guard,
-						// deliberately not carrying nonce/replacement state.
+						// Bounded wait: on timeout this throws and the minter is left unmarked to retry next
+						// cycle. A retry sends a fresh-nonce tx (it does not replace a stuck one); under sustained
+						// mempool/gas pathology the deny may not land, but the terminal FAILED alert then pages a
+						// human — an accepted limitation of the opt-in guard, deliberately not carrying
+						// nonce/replacement state.
+						//
+						// INVARIANT: the cycle deadline governs whether a send is STARTED, not how long an
+						// in-flight transaction is awaited. Compute waitTimeoutMs HERE (after broadcast), not
+						// before denyMinter: with no gas/fee overrides that call populates the tx first (gas
+						// estimation, fee data, nonce), then signs and broadcasts — so a pre-send remaining-budget
+						// value is stale by the whole submission duration and can starve the wait. Once broadcast,
+						// the guard waits at least DENY_CONFIRM_MIN_WAIT_MS so the timeout is positive by
+						// construction and the cycle may overshoot by that floor at most. A non-positive timeout
+						// must never be submitted: ethers passes it to setTimeout, Node clamps it to ~1 ms, and
+						// tx.wait rejects almost immediately while the transaction is still in flight — burning a
+						// MAX_DENY_ATTEMPTS slot and risking a redundant fresh-nonce resend for a deny that may
+						// confirm on its own.
+						const waitTimeoutMs = Math.min(
+							DENY_CONFIRM_TIMEOUT_MS,
+							Math.max(this.cycleRemainingMs(cycleStartedAt), DENY_CONFIRM_MIN_WAIT_MS)
+						);
 						const receipt: ethers.ContractTransactionReceipt | null = await tx.wait(1, waitTimeoutMs);
 						if (!receipt) {
 							// wait resolved without a receipt (should be rare with confirms=1); treat as unconfirmed for retry.
@@ -868,8 +883,19 @@ export class MinterGuardService {
 							// "manual denyMinter() required" page erodes trust in every other page the guard sends.
 							if (done && !prev.alerted) {
 								let deadlineForRemedy = currentDeadline;
+								// Start from the pre-send block clock; replaced only when both re-reads succeed.
+								let blockTsForRemedy = BigInt(latestBlock.timestamp);
 								let recheckNote = '';
 								try {
+									// Both sides of the windowClosed decision must come from the same moment: a
+									// fresh deadline compared against a stale pre-send block clock biases the remedy
+									// toward "still open" and can tell an operator to deny manually after that has
+									// become impossible (submission + confirmation wait can span up to the
+									// confirmation timeout after the pre-send getBlock).
+									const freshBlock = await this.providerService.provider.getBlock('latest');
+									if (!freshBlock) {
+										throw new Error(`provider.getBlock('latest') returned null after deny failure for ${address}`);
+									}
 									const freshDeadline = BigInt(await juiceDollar.minters(address));
 									if (freshDeadline === 0n) {
 										// Resolved by someone else — mark done, send NO page.
@@ -881,8 +907,9 @@ export class MinterGuardService {
 										continue;
 									}
 									deadlineForRemedy = freshDeadline;
+									blockTsForRemedy = BigInt(freshBlock.timestamp);
 								} catch (recheckError) {
-									// A read failure here must not lose the page: fall back to the pre-send value and
+									// A read failure here must not lose the page: fall back to the pre-send values and
 									// say in the message that the on-chain state could not be re-checked.
 									const recheckMsg =
 										typeof recheckError?.message === 'string' && recheckError.message
@@ -892,12 +919,13 @@ export class MinterGuardService {
 										`MinterGuard: could not re-check on-chain state for ${address} after deny failure: ${recheckMsg}`
 									);
 									recheckNote =
-										' On-chain state could not be re-checked after the failure; remedy text uses the pre-send deadline.';
+										' On-chain state could not be re-checked after the failure; ' +
+										'remedy text uses the pre-send deadline and block clock.';
 								}
 								// Chain clock and contract comparison only: denyMinter gates on
 								// block.timestamp > minters[_minter]. Local Date.now() skew or >= would let the
 								// remedy text contradict what the contract would still accept.
-								const windowClosed = BigInt(latestBlock.timestamp) > deadlineForRemedy;
+								const windowClosed = blockTsForRemedy > deadlineForRemedy;
 								const remedy = windowClosed
 									? 'The application period has ended — denyMinter is impossible; challenge/handle the minter otherwise if needed.'
 									: 'Manual denyMinter() required before the application period ends.';
@@ -1117,6 +1145,7 @@ export class MinterGuardService {
 	 *   - ok=true  => helpers are ready; proceed to per-candidate deny loop.
 	 *   - ok=false => SKIP all denies this cycle. Paths that produce ok=false:
 	 *       * cycle budget already below DENY_CONFIRM_MIN_USEFUL_MS at entry — defer (warn, no page),
+	 *       * cycle deadline exhausted between sequential pre-check chain calls — defer (warn, no page),
 	 *       * under quorum (votes) — rate-limited 'votes' page when candidates exist,
 	 *       * low gas — rate-limited 'gas' page when candidates exist,
 	 *       * seed rejected by votesDelegated — rate-limited 'seed' page, then continues seed-less if retry works
@@ -1165,17 +1194,53 @@ export class MinterGuardService {
 			// reads like an RPC fault. If EmptyRevert fires and we have a seed, retry once seed-less so a
 			// config typo cannot silently disable the guard forever. (A seed equal to the signer is detected
 			// and cleared in initialize — it never reaches this path.)
+			//
+			// Deadline between each sequential chain call (same convention as the resolve pass / sweep): an
+			// outstanding RPC cannot be cancelled, so the cycle may still overshoot by at most one call —
+			// not by the full remaining chain of four-to-six reads when only the entry check ran.
 			let totalVotes: bigint;
 			let delegatedVotes: bigint;
 			try {
+				if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+					this.logger.warn(
+						`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+							`totalVotes() not reached — deferring ${candidates.length} candidate(s) to the next cycle ` +
+							`(not marked done, no page — deferral is not a failure).`
+					);
+					return { ok: false, helpers };
+				}
 				totalVotes = BigInt(await equity.totalVotes());
+				if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+					this.logger.warn(
+						`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+							`votesDelegated() not reached — deferring ${candidates.length} candidate(s) to the next cycle ` +
+							`(not marked done, no page — deferral is not a failure).`
+					);
+					return { ok: false, helpers };
+				}
 				delegatedVotes = BigInt(await equity.votesDelegated(signerAddress, helpers));
 			} catch (votesError) {
 				const classification = classifyDenyError(votesError, denyErrorInterface);
 				if (classification.label === 'EmptyRevert' && this.helperSeed.length > 0) {
 					const seedLess = computeHelpers(delegations, signerAddress);
 					try {
+						if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+							this.logger.warn(
+								`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+									`seed-drop totalVotes() not reached — deferring ${candidates.length} ` +
+									`candidate(s) to the next cycle (not marked done, no page — deferral is not a failure).`
+							);
+							return { ok: false, helpers };
+						}
 						totalVotes = BigInt(await equity.totalVotes());
+						if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+							this.logger.warn(
+								`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+									`seed-drop votesDelegated() not reached — deferring ${candidates.length} ` +
+									`candidate(s) to the next cycle (not marked done, no page — deferral is not a failure).`
+							);
+							return { ok: false, helpers };
+						}
 						delegatedVotes = BigInt(await equity.votesDelegated(signerAddress, seedLess));
 						helpers = seedLess;
 						this.logger.error(
@@ -1218,9 +1283,25 @@ export class MinterGuardService {
 				return { ok: false, helpers };
 			}
 
+			if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+				this.logger.warn(
+					`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+						`getFeeData() not reached — deferring ${candidates.length} candidate(s) to the next cycle ` +
+						`(not marked done, no page — deferral is not a failure).`
+				);
+				return { ok: false, helpers };
+			}
 			const feeData = await provider.getFeeData();
 			const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice;
 			if (gasPrice === null || gasPrice === undefined) throw new Error('feeData has neither maxFeePerGas nor gasPrice');
+			if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+				this.logger.warn(
+					`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+						`getBalance() not reached — deferring ${candidates.length} candidate(s) to the next cycle ` +
+						`(not marked done, no page — deferral is not a failure).`
+				);
+				return { ok: false, helpers };
+			}
 			const balance: bigint = await provider.getBalance(signerAddress);
 
 			// Worst-case gas floor FIRST, independent of estimateGas: some nodes verify balance inside
@@ -1263,6 +1344,14 @@ export class MinterGuardService {
 			//     candidate this cycle (e.g. sample just crossed its own deadline). Proceed on the floor;
 			//     the per-candidate TooLate guard + try/catch handle each send.
 			try {
+				if (this.cycleRemainingMs(cycleStartedAt) <= 0) {
+					this.logger.warn(
+						`MinterGuard: deny pre-check stopped (cycle deadline ${CYCLE_BUDGET_MS}ms); ` +
+							`estimateGas() not reached — deferring ${candidates.length} candidate(s) to the next cycle ` +
+							`(not marked done, no page — deferral is not a failure).`
+					);
+					return { ok: false, helpers };
+				}
 				const jusd = new ethers.Contract(ADDRESS[chainId].juiceDollar, JuiceDollarABI, wallet);
 				const gasEstimate: bigint = BigInt(
 					await jusd.denyMinter.estimateGas(candidates[0].address, helpers, 'minter-guard gas estimate')
