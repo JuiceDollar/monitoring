@@ -269,6 +269,38 @@ describe('classifyDenyError', () => {
 		expect(result.label).toBe('TooLate');
 	});
 
+	it('classifies TRANSACTION_REPLACED as TransactionReplaced (transient), not a mined revert', () => {
+		// ethers v6 TRANSACTION_REPLACED carries a receipt for the REPLACEMENT, which may have
+		// status===1 — must not be reported as "mined and reverted".
+		const hash = '0x' + 'ef'.repeat(32);
+		const error = {
+			message: 'transaction was replaced',
+			code: 'TRANSACTION_REPLACED',
+			reason: 'repriced',
+			replacement: { hash },
+			receipt: { status: 1, hash },
+		};
+		const result = classifyDenyError(error, iface);
+		expect(result.kind).toBe('transient');
+		expect(result.label).toBe('TransactionReplaced');
+		expect(result.detail).toContain(hash);
+		expect(result.detail).toContain('repriced');
+		expect(result.detail).not.toMatch(/reverted/i);
+	});
+
+	it('does not classify a success receipt (status===1) without revert data as RevertedOnChain', () => {
+		// Tightened mined-revert branch requires receipt.status === 0; a status===1 receipt alone
+		// must fall through (no data, no CALL_EXCEPTION / missing-revert marker → NoRevertData).
+		const error = {
+			message: 'something went wrong after send',
+			receipt: { status: 1, hash: '0x' + '11'.repeat(32) },
+		};
+		const result = classifyDenyError(error, iface);
+		expect(result.label).not.toBe('RevertedOnChain');
+		expect(result.kind).toBe('transient');
+		expect(result.label).toBe('NoRevertData');
+	});
+
 	it('classifies NETWORK_ERROR with no data as NoRevertData and names the code', () => {
 		const error = { message: 'could not detect network', code: 'NETWORK_ERROR' };
 		const result = classifyDenyError(error, iface);

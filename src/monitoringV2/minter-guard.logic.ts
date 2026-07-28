@@ -5,7 +5,9 @@ export const QUORUM_BPS = 200n;
 
 export interface DenyErrorClass {
 	kind: 'permanent' | 'transient';
-	label: string; // 'TooLate' | 'NotQualified' | 'EmptyRevert' | 'RevertedOnChain' | 'NoRevertData' | a decoded error name | 'Unknown'
+	// 'TooLate' | 'NotQualified' | 'EmptyRevert' | 'RevertedOnChain' | 'TransactionReplaced' |
+	// 'NoRevertData' | a decoded error name | 'Unknown'
+	label: string;
 	detail: string; // human-readable diagnosis for logs + Telegram
 }
 
@@ -78,14 +80,16 @@ export function computeHelpers(delegations: Array<{ from: string; to: string }>,
 /**
  * Classifies a failed denyMinter/votesDelegated error into permanent vs transient with a diagnosis.
  *
- * Separates three failure surfaces:
+ * Separates four failure surfaces:
  *   - eth_call / estimateGas bare require (empty revert data) — helper-list rejection before send,
  *   - mined receipt with status === 0 — ethers reports data:null even when a custom error fired,
+ *   - TRANSACTION_REPLACED — the guard's tx was repriced/cancelled/replaced; the replacement's outcome
+ *     decides what actually happened (must not be misread as a mined revert of the original),
  *   - client/transport/account failure — no on-chain revert marker at all.
  *
  * Permanent (TooLate): the application window has closed — retrying forever is useless and would only
- * burn gas + page. Transient: under-quorum, helper-list rejection, mined-but-reverted, RPC blips,
- * unknown — may recover next cycle (or after operator action) within the attempt cap.
+ * burn gas + page. Transient: under-quorum, helper-list rejection, mined-but-reverted, replaced tx,
+ * RPC blips, unknown — may recover next cycle (or after operator action) within the attempt cap.
  */
 export function classifyDenyError(error: unknown, iface: ethers.Interface): DenyErrorClass {
 	const err = error as any;
@@ -160,12 +164,37 @@ export function classifyDenyError(error: unknown, iface: ethers.Interface): Deny
 		};
 	}
 
-	// 2. Mined receipt revert (ethers checkReceipt: status===0 throws CALL_EXCEPTION with data:null
-	// and a receipt). Distinct from eth_call empty-data EmptyRevert — NOT a helper-list signal.
-	// kind stays transient: the authoritative on-chain window check at the start of the next cycle
-	// decides whether anything is still deniable.
+	// 2. TRANSACTION_REPLACED: ethers attaches a receipt for the REPLACEMENT, not a status===0 proof
+	// that the guard's original tx reverted. Classifying this as RevertedOnChain is wrong (and can be
+	// the opposite of the truth when the replacement succeeded). Transient: the next cycle's on-chain
+	// deadline read decides whether anything is still deniable.
+	if (err?.code === 'TRANSACTION_REPLACED') {
+		let hashSuffix = '';
+		if (typeof err?.replacement?.hash === 'string') {
+			hashSuffix = ` replacement=${err.replacement.hash}`;
+		} else if (typeof err?.receipt?.hash === 'string') {
+			hashSuffix = ` replacement=${err.receipt.hash}`;
+		}
+		const reasonSuffix = typeof err?.reason === 'string' && err.reason.length > 0 ? ` reason=${err.reason}` : '';
+		return {
+			kind: 'transient',
+			label: 'TransactionReplaced',
+			detail:
+				"The guard's transaction was replaced or repriced; the replacement's outcome decides what " +
+				"actually happened on-chain. The next cycle's on-chain deadline read determines whether " +
+				'anything is still deniable.' +
+				reasonSuffix +
+				hashSuffix,
+		};
+	}
+
+	// 3. Mined receipt revert (ethers checkReceipt: status===0 throws CALL_EXCEPTION with data:null
+	// and a receipt). Require status === 0 so a success receipt carried on some other error shape is
+	// not misclassified as a revert. Distinct from eth_call empty-data EmptyRevert — NOT a helper-list
+	// signal. kind stays transient: the authoritative on-chain window check at the start of the next
+	// cycle decides whether anything is still deniable.
 	const receipt = err?.receipt;
-	if (receipt !== null && typeof receipt === 'object') {
+	if (receipt !== null && typeof receipt === 'object' && receipt.status === 0) {
 		// ethers receipt uses `.hash`; some shapes expose `.transactionHash` instead.
 		let hashSuffix = '';
 		if (typeof receipt.hash === 'string') {
@@ -186,22 +215,22 @@ export function classifyDenyError(error: unknown, iface: ethers.Interface): Deny
 		};
 	}
 
-	// 3. A data candidate exists and is exactly empty hex ('0x' / '0X') -> real empty-data eth_call revert.
+	// 4. A data candidate exists and is exactly empty hex ('0x' / '0X') -> real empty-data eth_call revert.
 	if (data === '0x' || data === '0X') {
 		return emptyRevert;
 	}
 
-	// 4. No data candidate, but still recognisably an on-chain revert -> EmptyRevert.
+	// 5. No data candidate, but still recognisably an on-chain revert -> EmptyRevert.
 	// ethers v6 surfaces a data-less CALL_EXCEPTION / "missing revert data" this way, which is what
 	// distinguishes a real empty-data eth_call revert from a client/transport failure (no data, no
-	// revert marker). Reached only when there is no mined receipt (step 2 above).
+	// revert marker). Reached only when there is no mined failed receipt (step 3 above).
 	const code = err?.code;
 	const isOnChainEmptyRevert = message.toLowerCase().includes('missing revert data') || code === 'CALL_EXCEPTION';
 	if (isOnChainEmptyRevert) {
 		return emptyRevert;
 	}
 
-	// 5. No data candidate and no revert marker -> client/transport/account failure, not a helper-list
+	// 6. No data candidate and no revert marker -> client/transport/account failure, not a helper-list
 	// rejection. This class exists so we do NOT attribute network/nonce/timeout faults to the helper
 	// list (which would send the operator after GUARD_HELPER_ADDRESS and trip the pre-check seed-drop).
 	const codeSuffix = typeof code === 'string' && code.length > 0 ? ` code=${code}` : '';

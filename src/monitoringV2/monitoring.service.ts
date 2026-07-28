@@ -12,7 +12,7 @@ import { CollateralService } from './collateral.service';
 import { MinterService } from './minter.service';
 import { MinterGuardService, GuardConfigError } from './minter-guard.service';
 import { JusdService } from './jusd.service';
-import { TelegramService, escapeMarkdownText } from './telegram.service';
+import { TelegramService, escapeMarkdownText, truncateAlertBody } from './telegram.service';
 
 @Injectable()
 export class MonitoringService implements OnModuleInit {
@@ -56,10 +56,15 @@ export class MonitoringService implements OnModuleInit {
 			this.logger.error(`MinterGuard init failed — guard DISABLED, monitoring continues: ${errorMsg}`, error?.stack || error);
 			// One-shot bootstrap path, not a per-cycle watcher: no retry machinery here (unlike the guard's
 			// own per-cycle pendingAlert retry) — this logger.error is the durable record if delivery fails.
+			// Truncated as well as escaped: errorMsg can carry unbounded input (loadWhitelist embeds the
+			// configured path verbatim), and Telegram rejects a body over its length limit outright — which
+			// would make the single page announcing a disabled guard permanently undeliverable.
 			const delivered = await this.telegramService.sendCriticalAlert(
-				`⚠️ *Minter guard init failed — guard DISABLED*\n\n` +
-					`The auto-deny guard is OFF for this run; monitoring continues.\n` +
-					`Error: ${escapeMarkdownText(errorMsg)}`
+				truncateAlertBody(
+					`⚠️ *Minter guard init failed — guard DISABLED*\n\n` +
+						`The auto-deny guard is OFF for this run; monitoring continues.\n` +
+						`Error: ${escapeMarkdownText(errorMsg)}`
+				)
 			);
 			if (!delivered) {
 				this.logger.error(

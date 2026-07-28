@@ -304,3 +304,21 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 export function escapeMarkdownText(value: string): string {
 	return value.replace(/([_*`\[])/g, '\\$1');
 }
+
+// Safe Telegram body length (Telegram rejects sendMessage bodies over 4096). Comfortably under the hard
+// limit so Markdown/entity overhead cannot push a page into permanent undeliverable rejection.
+// Single source of truth for every alert site (guard, monitoring bootstrap, etc.).
+export const MAX_ALERT_BODY_CHARS = 3500;
+
+/**
+ * Truncate an alert body to MAX_ALERT_BODY_CHARS so Telegram cannot permanently reject it
+ * (hard limit 4096). A truncated body always ends with an explicit marker so operators know text was cut.
+ * Applied before every store and every send — never retain an untruncated body as pendingAlert.
+ * Exported so every alert site (minter-guard, monitoring.service guard-init failure, …) can reach it;
+ * an oversized body (e.g. a configured file path interpolated verbatim) must not make the single
+ * page announcing "the guard is disabled" permanently undeliverable.
+ */
+export function truncateAlertBody(body: string): string {
+	if (body.length <= MAX_ALERT_BODY_CHARS) return body;
+	return `${body.slice(0, MAX_ALERT_BODY_CHARS)}\n\n… (truncated)`;
+}
