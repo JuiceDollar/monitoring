@@ -135,6 +135,17 @@ export class PriceService {
 			return cached.value;
 		}
 
+		const fresh = await this.fetchAndCacheBtcPrice();
+		if (fresh !== null) return fresh;
+		return cached?.value ?? null;
+	}
+
+	/**
+	 * Unconditional fetch + cache + bookkeeping. Used both by the on-demand
+	 * `getBtcPriceInUsd` (after cache miss) and the active heartbeat below.
+	 * Returns null on upstream failure; never throws.
+	 */
+	private async fetchAndCacheBtcPrice(): Promise<string | null> {
 		try {
 			const { baseUrl, headers } = this.resolveCoingeckoEndpoint();
 			const response = await axios.get(`${baseUrl}/api/v3/simple/price?ids=bitcoin&vs_currencies=usd`, {
@@ -151,8 +162,23 @@ export class PriceService {
 			return price;
 		} catch (error) {
 			this.logger.error(`Failed to fetch BTC price: ${error.message}`);
-			return cached?.value ?? null;
+			return null;
 		}
+	}
+
+	/**
+	 * Active BTC heartbeat — fires every 5 minutes regardless of chain
+	 * activity. Without this, `btcLastSuccessMs` only advances when the
+	 * monitoring cycle pulls a WCBTC position price; if the chain stops
+	 * producing blocks (Citrea outage), the on-demand path never runs and
+	 * the hourly staleness watchdog below fires a false positive for a
+	 * problem that is entirely off the BTC-spot path. The heartbeat
+	 * decouples the watchdog from the block tick: it now only alerts when
+	 * CoinGecko/the pricing-proxy is actually unreachable.
+	 */
+	@Cron(CronExpression.EVERY_5_MINUTES)
+	async refreshBtcPriceHeartbeat(): Promise<void> {
+		await this.fetchAndCacheBtcPrice();
 	}
 
 	/**
